@@ -339,7 +339,9 @@ class RandomDataset(BenchmarkDataset):
     DEFAULT_RANGE_RATIO = 0.0
     DEFAULT_INPUT_LEN = 1024
     DEFAULT_OUTPUT_LEN = 128
-
+    DEFAULT_INPUT_PREFIX_LEN = 0
+    DEFAULT_GROUP_PREFIX_LEN = 0
+    DEFAULT_NUM_GROUPS = 1
     def __init__(
         self,
         **kwargs,
@@ -350,11 +352,13 @@ class RandomDataset(BenchmarkDataset):
         self,
         tokenizer: PreTrainedTokenizerBase,
         num_requests: int,
-        prefix_len: int = DEFAULT_PREFIX_LEN,
         range_ratio: float = DEFAULT_RANGE_RATIO,
         input_len: int = DEFAULT_INPUT_LEN,
         output_len: int = DEFAULT_OUTPUT_LEN,
+        num_groups:int = DEFAULT_NUM_GROUPS,
         request_id_prefix: str = "",
+        input_prefix_len: int = DEFAULT_INPUT_PREFIX_LEN,
+        group_prefix_len: int = DEFAULT_GROUP_PREFIX_LEN,
         **kwargs,
     ) -> list[SampleRequest]:
         # Enforce range_ratio < 1
@@ -366,19 +370,10 @@ class RandomDataset(BenchmarkDataset):
         num_special_tokens = tokenizer.num_special_tokens_to_add()
         real_input_len = input_len - num_special_tokens
 
-        prefix_token_ids = (
-            np.random.randint(0, vocab_size, size=prefix_len).tolist()
-            if prefix_len > 0
-            else []
-        )
-
         # New sampling logic: [X * (1 - b), X * (1 + b)]
         input_low = int(real_input_len * (1 - range_ratio))
         input_high = int(real_input_len * (1 + range_ratio))
         output_low = int(output_len * (1 - range_ratio))
-        # Ensure the lower bound for output length is at least 1 to prevent
-        # sampling 0 tokens, which can cause request failures.
-        output_low = max(output_low, 1)
         output_high = int(output_len * (1 + range_ratio))
 
         # Add logging for debugging
@@ -389,37 +384,51 @@ class RandomDataset(BenchmarkDataset):
         output_lens = np.random.randint(output_low, output_high + 1, size=num_requests)
         offsets = np.random.randint(0, vocab_size, size=num_requests)
 
-        requests = []
-        for i in range(num_requests):
-            inner_seq = (
-                (offsets[i] + i + np.arange(input_lens[i])) % vocab_size
-            ).tolist()
-            token_sequence = prefix_token_ids + inner_seq
-            prompt = tokenizer.decode(token_sequence)
-            # After decoding the prompt we have to encode and decode it again.
-            # This is done because in some cases N consecutive tokens
-            # give a string tokenized into != N number of tokens.
-            # For example for GPT2Tokenizer:
-            # [6880, 6881] -> ['Ġcalls', 'here'] ->
-            # [1650, 939, 486] -> ['Ġcall', 'sh', 'ere']
-            # To avoid uncontrolled change of the prompt length,
-            # the encoded sequence is truncated before being decode again.
-            total_input_len = prefix_len + int(input_lens[i])
-            re_encoded_sequence = tokenizer.encode(prompt, add_special_tokens=False)[
-                :total_input_len
-            ]
-            prompt = tokenizer.decode(re_encoded_sequence)
-            total_input_len = len(re_encoded_sequence)
-            requests.append(
-                SampleRequest(
-                    prompt=prompt,
-                    prompt_len=total_input_len,
-                    expected_output_len=int(output_lens[i]),
-                    request_id=request_id_prefix + str(i),
-                )
+        prefix_token_ids_1 = (
+                np.random.randint(0, vocab_size, size=input_prefix_len).tolist()
+                if input_prefix_len > 0
+                else []
             )
+        assert num_requests % num_groups == 0, "num_requests must be divisible by num_groups"
+        assert num_groups > 0, "num_groups must be positive"
+        assert num_groups <= num_requests, "num_groups cannot be greater than num_requests"
 
-        return requests
+        group_size = num_requests // num_groups
+        requests = [[] for _ in range(num_groups)]
+        for group in range(num_groups):
+            prefix_token_ids_2 = (
+                np.random.randint(0, vocab_size, size=group_prefix_len).tolist()
+                if group_prefix_len > 0
+                else []
+            )
+            for i in range(group * group_size, (group + 1) * group_size):
+                inner_seq = (
+                    (offsets[i] + i + np.arange(input_lens[i])) % vocab_size
+                ).tolist()
+                token_sequence = prefix_token_ids_1 + prefix_token_ids_2 + inner_seq
+                prompt = tokenizer.decode(token_sequence)
+                # After decoding the prompt we have to encode and decode it again.
+                # This is done because in some cases N consecutive tokens
+                # give a string tokenized into != N number of tokens.
+                # For example for GPT2Tokenizer:
+                # [6880, 6881] -> ['Ġcalls', 'here'] ->
+                # [1650, 939, 486] -> ['Ġcall', 'sh', 'ere']
+                # To avoid uncontrolled change of the prompt length,
+                # the encoded sequence is truncated before being decode again.
+                re_encoded_sequence = tokenizer.encode(prompt, add_special_tokens=False)[
+                    : input_lens[i] + input_prefix_len + group_prefix_len
+                ]
+                prompt = tokenizer.decode(re_encoded_sequence)
+                total_input_len = input_prefix_len + group_prefix_len + int(input_lens[i])
+                requests[group].append(
+                    SampleRequest(
+                        prompt=prompt,
+                        prompt_len=total_input_len,
+                        expected_output_len=int(output_lens[i]),
+                        request_id=request_id_prefix + str(i),
+                    )
+                )
+        return [request for group_requests in requests for request in group_requests]
 
 
 # -----------------------------------------------------------------------------

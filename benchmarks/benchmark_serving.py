@@ -780,11 +780,13 @@ def main(args: argparse.Namespace):
             "random": lambda: RandomDataset(dataset_path=args.dataset_path).sample(
                 tokenizer=tokenizer,
                 num_requests=args.num_prompts,
-                prefix_len=args.random_prefix_len,
                 input_len=args.random_input_len,
                 output_len=args.random_output_len,
                 range_ratio=args.random_range_ratio,
                 request_id_prefix=args.request_id_prefix,
+                input_prefix_len=args.random_input_prefix_len,
+                group_prefix_len=args.random_group_prefix_len,
+                num_groups=args.num_groups,
             ),
         }
 
@@ -823,6 +825,22 @@ def main(args: argparse.Namespace):
     gc.collect()
     gc.freeze()
 
+    # Reorganize the distribution of input_requests
+    if args.request_recurrence_mode == 'repeat_pattern':
+        input_requests = input_requests * args.repeat_num
+    elif args.request_recurrence_mode == 'stack_pattern':
+        reversed_requests = list(reversed(input_requests))
+        input_requests = input_requests + reversed_requests
+    elif args.request_recurrence_mode == 'group_pattern':
+        group_nums = args.num_prompts // args.num_groups
+        grouped = [[] for _ in range(group_nums)]
+        for idx, req in enumerate(input_requests):
+            group_index = idx % group_nums
+            grouped[group_index].append(req)
+        input_requests = [req for sublist in grouped for req in sublist]
+    else:
+        input_requests = input_requests
+    
     benchmark_result = asyncio.run(
         benchmark(
             backend=backend,
@@ -1131,6 +1149,42 @@ def create_argument_parser():
         "and the blog: https://hao-ai-lab.github.io/blogs/distserve",
     )
     parser.add_argument(
+        "--request-recurrence-mode",
+        type=str,
+        choices=["None","repeat_pattern", "stack_pattern", "group_pattern"], 
+        default=None, 
+        help=(
+            "Specify the pattern for repeating input requests during benchmarking.\n\n"
+            
+            "None   : Each request executes only once.\n"
+            "Options:\n"
+            "repeat_pattern   : Duplicates all requests while maintaining original order.\n"
+            "           Example: [A, B, C] → [A, B, C, A, B, C]\n"
+            "           Use case: Tests caching effectiveness and performance consistency "
+            "for repeated identical requests.\n\n"
+            
+            "stack_pattern  : Appends the request repeat num"          
+            "Example: [A, B, C] → [A, B, C, C, B, A]\n"
+            "           Use case: Tests system behavior with reversing request patterns, "
+            "simulating stack-like processing workflows.\n\n"
+
+            "group_pattern   : Redistributes requests by grouping them in round-robin fashion, "
+            "where requests are assigned to groups based on index modulo group_nums\n"
+            "                Example: [A, B, C, D, E, F] with num_groups=2 (group_nums=3) "
+            "=> [A, D, B, E, C, F]\n"
+            "                Use case: Tests system's handling of grouped batch processing, "
+            "simulating workflows where related requests are clustered together.\n\n"
+        )
+    )
+    parser.add_argument(
+        "--repeat-num",
+        type=int,
+        default=2,
+        help=(
+            "Number of request repeat num "
+        ),
+    )
+    parser.add_argument(
         "--request-id-prefix",
         type=str,
         required=False,
@@ -1204,17 +1258,36 @@ def create_argument_parser():
         "[length * (1 - range_ratio), length * (1 + range_ratio)].",
     )
     random_group.add_argument(
-        "--random-prefix-len",
+        "--random-input-prefix-len",
         type=int,
         default=0,
         help=(
             "Number of fixed prefix tokens before the random context "
             "in a request. "
-            "The total input length is the sum of `random-prefix-len` and "
+            "The total input length is the sum of `random-input-prefix-len` , `random-group-prefix-len` and "
             "a random "
             "context length sampled from [input_len * (1 - range_ratio), "
             "input_len * (1 + range_ratio)]."
         ),
+    )
+    random_group.add_argument(
+        "--random-group-prefix-len",
+        type=int,
+        default=0,
+        help=(
+            "Number of fixed prefix tokens before the random context "
+            "in a request. "
+            "The total input length is the sum of `random-input-prefix-len` , `random-group-prefix-len` and "
+            "a random "
+            "context length sampled from [input_len * (1 - range_ratio), "
+            "input_len * (1 + range_ratio)]."
+        ),
+    )
+    random_group.add_argument(
+        "--num-groups",
+        type=int,
+        default=1,
+        help="Number of groups.",
     )
 
     hf_group = parser.add_argument_group("hf dataset options")
