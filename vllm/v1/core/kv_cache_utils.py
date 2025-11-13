@@ -1027,6 +1027,7 @@ def get_kv_cache_config_from_groups(vllm_config: VllmConfig,
         )
 
     # Determine how model runners should initialize the KV cache tensors.
+    page_size = get_uniform_page_size(kv_cache_specs)
     if len(kv_cache_groups) == 1 and \
         isinstance(kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs):
         # Special case: all layers have the same type of KV cache but with
@@ -1053,7 +1054,6 @@ def get_kv_cache_config_from_groups(vllm_config: VllmConfig,
         # full.1, sw.2: share another Tensor with size=available_memory//2
         group_size = max(len(group.layer_names) for group in kv_cache_groups)
 
-        page_size = get_uniform_page_size(kv_cache_specs)
         assert group_size > 0, "group_size must be greater than 0"
         num_blocks = get_num_blocks(vllm_config, group_size, available_memory,
                                     page_size)
@@ -1067,8 +1067,12 @@ def get_kv_cache_config_from_groups(vllm_config: VllmConfig,
                 KVCacheTensor(size=page_size * num_blocks,
                               shared_by=shared_by))
 
+    num_cpu_blocks = int(vllm_config.cache_config.swap_space_bytes //
+                         page_size // len(kv_cache_specs))
+
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,
+        num_cpu_blocks=num_cpu_blocks,
         kv_cache_tensors=kv_cache_tensors,
         kv_cache_groups=kv_cache_groups,
     )
