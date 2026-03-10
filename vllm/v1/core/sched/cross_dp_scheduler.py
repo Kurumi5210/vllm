@@ -30,6 +30,7 @@ from vllm.v1.core.encoder_cache_manager import (
     EncoderDecoderCacheManager,
     compute_encoder_budget,
 )
+from vllm.v1.core.sched.dynamic_bucket_load_balancer import NoStandardBucketLoadBalancer
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.cross_dp_kv_cache_manager import CrossDPKVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
@@ -70,7 +71,7 @@ class RequestManager:
         self.num_long_req_per_domain = 0
         self.num_req_per_dp = [0] * self.cp_world_size
 
-    def select_dp(self, request: Request, is_long: bool) -> list[int] | None:
+    def select_dp(self, request: Request, is_long: bool, num_new_tokens: int) -> list[int] | None:
         if len(request.cp_ranks) > 0:
             if all([self.num_req_per_dp[rank] < self.max_num_seqs for rank in request.cp_ranks]):
                 return request.cp_ranks
@@ -83,7 +84,8 @@ class RequestManager:
             ]
         else:
             # Get the the dp with the least number of requests
-            best_dp = min(range(len(self.num_req_per_dp)), key=lambda i: self.num_req_per_dp[i])
+            # best_dp = min(range(len(self.num_req_per_dp)), key=lambda i: self.num_req_per_dp[i])
+            best_dp = self.balancer.dispatch_task_without_id(num_new_tokens)
             return [best_dp]
     
     def add_req(self, request: Request) -> None:
@@ -166,6 +168,9 @@ class CrossDPScheduler(Scheduler):
             cp_world_size=self.cp_world_size,
             max_num_seqs=self.max_num_running_reqs,
         )
+        self.balancer = NoStandardBucketLoadBalancer(
+            num_buckets=self.pcp_world_size,
+            max_length=self.dynamic_pcp_threshold[0])
 
     def _update_after_schedule(
         self,
@@ -670,12 +675,14 @@ class CrossDPScheduler(Scheduler):
                 if len(request.cp_ranks) == 0:
                     selected_dp = self.request_manager.select_dp(
                         request, 
-                        self.waiting.is_long_request(request)
+                        self.waiting.is_long_request(request),
+                        num_new_tokens,
                     )
                 else:
                     selected_dp = self.request_manager.select_dp(
                         request, 
-                        self.waiting.is_long_request(request)
+                        self.waiting.is_long_request(request),
+                        num_new_tokens,
                     )
                     if selected_dp is None:
                         break
@@ -911,6 +918,7 @@ class CrossDPScheduler(Scheduler):
 
         assert sum(len(sub) for sub in scheduled_resumed_reqs) == 0, "Scheduled resumed requests are not supported now."
         
+        self.balancer.release_all_tasks()
         # Construct the scheduler output.
         if self.use_v2_model_runner:
             raise NotImplementedError
