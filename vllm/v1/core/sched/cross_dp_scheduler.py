@@ -65,11 +65,15 @@ class RequestManager:
         self,
         cp_world_size: int,
         max_num_seqs: int,
+        dynamic_cp_threshold: int,
     ):
         self.cp_world_size = cp_world_size
         self.max_num_seqs = max_num_seqs
         self.num_long_req_per_domain = 0
         self.num_req_per_dp = [0] * self.cp_world_size
+        self.balancer = NoStandardBucketLoadBalancer(
+            num_buckets=self.pcp_world_size,
+            max_length=dynamic_cp_threshold)
 
     def select_dp(self, request: Request, is_long: bool, num_new_tokens: int) -> list[int] | None:
         if len(request.cp_ranks) > 0:
@@ -159,18 +163,17 @@ class CrossDPScheduler(Scheduler):
         self.max_cp_tokens = self.vllm_config.scheduler_config.num_cp_seqs
         self.graph_size_for_cp = self.vllm_config.compilation_config.cudagraph_capture_sizes_for_cp
         assert self.max_cp_tokens >= self.graph_size_for_cp, "max_cp_tokens should be greater than or equal to graph_size_for_cp"
+        self.dynamic_cp_threshold = 128 * 1024
         # Request queue control the token threshold for long requests.
         self.waiting = LongShortRequestQueue(
-            long_request_threshold=128 * 1024,
+            long_request_threshold=self.dynamic_cp_threshold,
             max_long_requests=self.max_cp_tokens,
         )
         self.request_manager = RequestManager(
             cp_world_size=self.cp_world_size,
             max_num_seqs=self.max_num_running_reqs,
+            dynamic_cp_threshold=self.dynamic_cp_threshold,
         )
-        self.balancer = NoStandardBucketLoadBalancer(
-            num_buckets=self.pcp_world_size,
-            max_length=self.dynamic_pcp_threshold[0])
 
     def _update_after_schedule(
         self,
@@ -672,26 +675,6 @@ class CrossDPScheduler(Scheduler):
                 if request is None:
                     break
 
-                if len(request.cp_ranks) == 0:
-                    selected_dp = self.request_manager.select_dp(
-                        request, 
-                        self.waiting.is_long_request(request),
-                        num_new_tokens,
-                    )
-                else:
-                    selected_dp = self.request_manager.select_dp(
-                        request, 
-                        self.waiting.is_long_request(request),
-                        num_new_tokens,
-                    )
-                    if selected_dp is None:
-                        break
-                
-                if len(selected_dp) > 1:
-                    logger.info(f"It's a cp req, selected_dp: {selected_dp}, request id: {request.request_id}")
-                else:
-                    logger.info(f"It's a short req, selected_dp: {selected_dp}, request id: {request.request_id}")
-
                 # KVTransfer: skip request if still waiting for remote kvs.
                 if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                     is_ready = self._update_waiting_for_remote_kv(request)
@@ -809,6 +792,26 @@ class CrossDPScheduler(Scheduler):
                 else:
                     num_encoder_tokens = 0
 
+                if len(request.cp_ranks) == 0:
+                    selected_dp = self.request_manager.select_dp(
+                        request, 
+                        self.waiting.is_long_request(request),
+                        num_new_tokens,
+                    )
+                else:
+                    selected_dp = self.request_manager.select_dp(
+                        request, 
+                        self.waiting.is_long_request(request),
+                        num_new_tokens,
+                    )
+                    if selected_dp is None:
+                        break
+                
+                if len(selected_dp) > 1:
+                    logger.info(f"It's a cp req, selected_dp: {selected_dp}, request id: {request.request_id}")
+                else:
+                    logger.info(f"It's a short req, selected_dp: {selected_dp}, request id: {request.request_id}")
+
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     selected_dp,
                     request,
@@ -918,7 +921,7 @@ class CrossDPScheduler(Scheduler):
 
         assert sum(len(sub) for sub in scheduled_resumed_reqs) == 0, "Scheduled resumed requests are not supported now."
         
-        self.balancer.release_all_tasks()
+        self.request_manager.balancer.release_all_tasks()
         # Construct the scheduler output.
         if self.use_v2_model_runner:
             raise NotImplementedError
