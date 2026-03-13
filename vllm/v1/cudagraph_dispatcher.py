@@ -59,7 +59,7 @@ class CudagraphDispatcher:
         self.keys_initialized = False
 
     def _create_padded_batch_descriptor(
-        self, num_tokens: int, uniform_decode: bool, has_lora: bool
+        self, num_tokens: int, uniform_decode: bool, has_lora: bool, num_cp_tokens: int = 0
     ) -> BatchDescriptor:
         max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
         uniform_decode_query_len = self.uniform_decode_query_len
@@ -77,6 +77,7 @@ class CudagraphDispatcher:
             num_reqs=num_reqs,
             uniform=uniform_decode,
             has_lora=has_lora,
+            num_cp_tokens=num_cp_tokens,
         )
 
     def add_cudagraph_key(
@@ -88,7 +89,7 @@ class CudagraphDispatcher:
         self.cudagraph_keys[runtime_mode].add(batch_descriptor)
 
     def initialize_cudagraph_keys(
-        self, cudagraph_mode: CUDAGraphMode, uniform_decode_query_len: int
+        self, cudagraph_mode: CUDAGraphMode, uniform_decode_query_len: int,
     ):
         # This should be called only after attention backend is initialized. So we can
         # get the correct cudagraph mode after backend support is resolved.
@@ -132,10 +133,13 @@ class CudagraphDispatcher:
                 for x in self.compilation_config.cudagraph_capture_sizes
                 if x <= max_num_tokens and x >= uniform_decode_query_len
             ]
-            for bs, has_lora in product(cudagraph_capture_sizes_for_decode, lora_cases):
+
+            
+            num_cp_tokens_list = [i for i in range(self.compilation_config.cudagraph_capture_sizes_for_cp + 1)]
+            for bs, has_lora, cp_tokens in product(cudagraph_capture_sizes_for_decode, lora_cases, num_cp_tokens_list):
                 self.add_cudagraph_key(
                     CUDAGraphMode.FULL,
-                    self._create_padded_batch_descriptor(bs, True, has_lora),
+                    self._create_padded_batch_descriptor(bs, True, has_lora, cp_tokens),
                 )
 
         self.keys_initialized = True
@@ -146,6 +150,7 @@ class CudagraphDispatcher:
         uniform_decode: bool,
         has_lora: bool,
         disable_full: bool = False,
+        num_cp_tokens: int = 0,
     ) -> tuple[CUDAGraphMode, BatchDescriptor]:
         """
         Given conditions(e.g.,batch descriptor and if using cascade attention),
@@ -161,7 +166,7 @@ class CudagraphDispatcher:
             return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)
 
         batch_desc = self._create_padded_batch_descriptor(
-            num_tokens, uniform_decode, has_lora
+            num_tokens, uniform_decode, has_lora, num_cp_tokens
         )
         relaxed_batch_desc = batch_desc.relax_for_mixed_batch_cudagraphs()
 

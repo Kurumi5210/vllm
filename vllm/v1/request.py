@@ -137,6 +137,8 @@ class Request:
 
         self.skip_reading_prefix_cache = self.get_skip_reading_prefix_cache()
 
+        self.cp_ranks: list[int] = []
+
     @classmethod
     def from_engine_core_request(
         cls,

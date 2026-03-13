@@ -244,6 +244,9 @@ if TYPE_CHECKING:
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool = False
+    VLLM_USE_FORCE_LOAD_BALANCE: bool = False
+    # vllm/v1/attention/backends/mla/common.py:1965 has a tensor palceholder for mla which is unnecessary for decode instance
+    VLLM_IGNORE_TENSOR_PLACEHOLDER: bool = False
 
 
 def get_default_cache_root():
@@ -1564,6 +1567,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Flag to enable v2 model runner.
     "VLLM_USE_V2_MODEL_RUNNER": lambda: bool(
         int(os.getenv("VLLM_USE_V2_MODEL_RUNNER", "0"))
+    ),
+    # Flag to enable force load balance.
+    "VLLM_USE_FORCE_LOAD_BALANCE": lambda: bool(
+        int(os.getenv("VLLM_USE_FORCE_LOAD_BALANCE", "0"))
+    ),
+    # vllm/v1/attention/backends/mla/common.py:1965 has a tensor palceholder for mla which is unnecessary for decode instance
+    "VLLM_IGNORE_TENSOR_PLACEHOLDER": lambda: bool(
+        int(os.getenv("VLLM_IGNORE_TENSOR_PLACEHOLDER", "0"))
     ),
 }
 

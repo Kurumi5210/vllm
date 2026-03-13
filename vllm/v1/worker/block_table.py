@@ -4,7 +4,7 @@
 import numpy as np
 import torch
 
-from vllm.distributed import get_dcp_group, get_pcp_group
+from vllm.distributed import get_dycp_group, get_dcp_group, get_pcp_group
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.utils import CpuGpuBuffer
@@ -94,6 +94,14 @@ class BlockTable:
             # DCP might not be initialized in testing
             self.dcp_world_size = 1
             self.dcp_rank = 0
+        try:
+            self.dycp_world_size = get_dycp_group().world_size
+            self.dycp_rank = get_dycp_group().rank_in_group
+        except AssertionError:
+            # DCP might not be initialized in testing
+            self.dycp_world_size = 1
+            self.dycp_rank = 0
+        
         self.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
 
     def append_row(
@@ -188,6 +196,67 @@ class BlockTable:
                 block_offsets,
                 out=self.slot_mapping.np[: req_indices.shape[0]],
             )
+
+    def compute_domain_slot_mapping(self, req_indices: np.ndarray, positions: np.ndarray, num_dycp_reqs: int = 0) -> None:
+        # Split requests into dycp (dcp) and dp groups
+        # req_indices < num_dycp_reqs: use dcp calculation
+        # req_indices >= num_dycp_reqs: use dp calculation
+        num_tokens = req_indices.shape[0]
+        dycp_mask = req_indices < num_dycp_reqs
+        
+        total_cp_world_size = self.dycp_world_size
+        total_cp_rank = self.dycp_rank
+        
+        # Initialize output array
+        slot_mapping_result = np.zeros(num_tokens, dtype=np.int64)
+        
+        # Process dycp requests (dcp calculation)
+        if np.any(dycp_mask):
+            dycp_indices = np.where(dycp_mask)[0]
+            dycp_req_indices = req_indices[dycp_mask]
+            dycp_positions = positions[dycp_mask]
+            
+            if total_cp_world_size > 1:
+                # Use DCP calculation for dycp requests
+                virtual_block_size = self.block_size * total_cp_world_size
+                block_table_indices = (
+                    dycp_req_indices * self.max_num_blocks_per_req
+                    + dycp_positions // virtual_block_size
+                )
+                
+                block_numbers = self.block_table.np.ravel()[block_table_indices]
+                virtual_block_offsets = dycp_positions % virtual_block_size
+                mask = (
+                    virtual_block_offsets
+                    // self.cp_kv_cache_interleave_size
+                    % total_cp_world_size
+                    == total_cp_rank
+                )
+                block_offsets = (
+                    virtual_block_offsets
+                    // (total_cp_world_size * self.cp_kv_cache_interleave_size)
+                    * self.cp_kv_cache_interleave_size
+                    + virtual_block_offsets % self.cp_kv_cache_interleave_size
+                )
+                slot_mapping = block_numbers * self.block_size + block_offsets
+                slot_mapping_result[dycp_indices] = np.where(mask, slot_mapping, -1)
+        
+        # Process dp requests (simple calculation)
+        if np.any(~dycp_mask):
+            dp_indices = np.where(~dycp_mask)[0]
+            dp_req_indices = req_indices[~dycp_mask]
+            dp_positions = positions[~dycp_mask]
+            
+            # Use DP calculation (total_cp_world_size == 1 case)
+            block_table_indices = (
+                dp_req_indices * self.max_num_blocks_per_req + dp_positions // self.block_size
+            )
+            block_numbers = self.block_table.np.ravel()[block_table_indices]
+            block_offsets = dp_positions % self.block_size
+            slot_mapping_result[dp_indices] = block_numbers * self.block_size + block_offsets
+        
+        # Write final slots
+        self.slot_mapping.np[:num_tokens] = slot_mapping_result
 
     def commit_block_table(self, num_reqs: int) -> None:
         self.block_table.copy_to_gpu(num_reqs)
@@ -325,6 +394,12 @@ class MultiGroupBlockTable:
     ) -> None:
         for block_table in self.block_tables:
             block_table.compute_slot_mapping(req_indices, positions)
+
+    def compute_domain_slot_mapping(
+        self, req_indices: np.ndarray, positions: np.ndarray, num_dycp_reqs: int = 0
+    ) -> None:
+        for block_table in self.block_tables:
+            block_table.compute_domain_slot_mapping(req_indices, positions, num_dycp_reqs)
 
     def commit_block_table(self, num_reqs: int) -> None:
         for block_table in self.block_tables:

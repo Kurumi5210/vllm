@@ -16,7 +16,7 @@ from vllm.attention.backends.abstract import (
     is_quantized_kv_cache,
 )
 from vllm.attention.layer import Attention
-from vllm.attention.ops.common import cp_lse_ag_out_rs
+from vllm.attention.ops.common import cp_lse_ag_out_rs, dycp_lse_out_ar, cp_lse_ag_out_ar
 from vllm.attention.ops.merge_attn_states import merge_attn_states
 from vllm.attention.utils.fa_utils import (
     flash_attn_supports_fp8,
@@ -33,7 +33,7 @@ if is_flash_attn_varlen_func_available():
     )
 from vllm.config import VllmConfig, get_current_vllm_config, get_layers_from_vllm_config
 from vllm.config.cache import CacheDType
-from vllm.distributed.parallel_state import get_dcp_group
+from vllm.distributed.parallel_state import get_dcp_group, get_dycp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.batch_invariant import (
     vllm_is_batch_invariant,
@@ -46,6 +46,7 @@ from vllm.v1.attention.backends.utils import (
     CommonAttentionMetadata,
     get_dcp_local_seq_lens,
     get_kv_cache_layout,
+    split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -210,6 +211,12 @@ class FlashAttentionMetadata:
     scheduler_metadata: torch.Tensor | None = None
     prefix_scheduler_metadata: torch.Tensor | None = None
     max_num_splits: int = 0
+    # For dycp
+    num_decodes:int = 0
+    num_prefills: int = 0
+    num_decode_tokens: int = 0
+    num_prefill_tokens: int = 0
+    num_dycp_reqs: int = 0
 
     causal: bool = True
 
@@ -286,6 +293,15 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             self.dcp_world_size = 1
             self.dcp_rank = 0
 
+        try:
+            from vllm.distributed.parallel_state import get_dycp_group
+
+            self.dycp_world_size = get_dycp_group().world_size
+            self.dycp_rank = get_dycp_group().rank_in_group
+        except AssertionError:
+            # DCP might not be initialized in testing
+            self.dycp_world_size = 1
+            self.dycp_rank = 0
         self.cp_kv_cache_interleave_size = (
             self.parallel_config.cp_kv_cache_interleave_size
         )
@@ -331,6 +347,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         block_table_tensor = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
         causal = common_attn_metadata.causal
+        num_dycp_reqs = common_attn_metadata.num_dycp_reqs
 
         # the overhead of the aot schedule is not worth it for spec-decode
         aot_schedule = self.aot_schedule and not fast_build
@@ -398,7 +415,13 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         prefix_kv_lens = None
         suffix_kv_lens = None
         prefix_scheduler_metadata = None
-
+        
+        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+            split_decodes_and_prefills(
+                common_attn_metadata,
+                require_uniform=True,
+            )
+        )
         if self.dcp_world_size > 1:
             query_kv_lens = query_start_loc[1:] - query_start_loc[:-1]
             dcp_context_kv_lens = seq_lens - query_kv_lens
@@ -426,6 +449,25 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                 max_seq_len=max_dcp_context_kv_len,
                 causal=False,
             )
+        elif self.dycp_world_size > 1:
+            num_dycp_reqs = common_attn_metadata.num_dycp_reqs
+            seq_lens[:num_dycp_reqs] = get_dcp_local_seq_lens(
+                seq_lens[:num_dycp_reqs],
+                self.dycp_world_size,
+                self.dycp_rank,
+                self.cp_kv_cache_interleave_size,
+            )
+            max_seq_len = seq_lens.max().item()
+            
+            scheduler_metadata = schedule(
+                batch_size=num_reqs,
+                cu_query_lens=query_start_loc,
+                max_query_len=max_query_len,
+                seqlens=seq_lens,
+                max_seq_len=max_seq_len,
+                causal=False,
+            )
+
         elif use_cascade:
             cu_prefix_query_lens = torch.tensor(
                 [0, num_actual_tokens], dtype=torch.int32, device=self.device
@@ -490,6 +532,11 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             prefix_scheduler_metadata=prefix_scheduler_metadata,
             max_num_splits=max_num_splits,
             causal=causal,
+            num_decodes=num_decodes,
+            num_prefills=num_prefills,
+            num_decode_tokens=num_decode_tokens,
+            num_prefill_tokens=num_prefill_tokens,
+            num_dycp_reqs=num_dycp_reqs,
         )
         return attn_metadata
 
@@ -596,6 +643,14 @@ class FlashAttentionImpl(AttentionImpl):
             # Profiling run.
             return output.fill_(0)
 
+        has_decode = attn_metadata.num_decodes > 0
+        has_prefill = attn_metadata.num_prefills > 0
+
+        if has_prefill and has_decode:
+            raise NotImplementedError(
+                "Prefill and decode are not supported in the dcyp forward pass."
+            )
+        
         attn_type = self.attn_type
 
         # IMPORTANT!
@@ -684,11 +739,14 @@ class FlashAttentionImpl(AttentionImpl):
                 )
                 return output
             else:
-                flash_attn_varlen_func(
+                """
+                dycp can reuse this function for decode
+                """
+                output[:num_actual_tokens], temp_lse = flash_attn_varlen_func(
                     q=query[:num_actual_tokens],
                     k=key_cache,
                     v=value_cache,
-                    out=output[:num_actual_tokens],
+                    out=None,
                     cu_seqlens_q=cu_seqlens_q,
                     max_seqlen_q=max_seqlen_q,
                     seqused_k=seqused_k,
@@ -706,7 +764,17 @@ class FlashAttentionImpl(AttentionImpl):
                     v_descale=layer._v_scale.expand(descale_shape),
                     num_splits=attn_metadata.max_num_splits,
                     s_aux=self.sinks,
+                    return_softmax_lse=True,
                 )
+
+                if self.dycp_world_size > 1:
+                    output[:attn_metadata.num_dycp_reqs] = cp_lse_ag_out_ar(
+                        output[:attn_metadata.num_dycp_reqs],
+                        temp_lse.transpose(0, 1)[:attn_metadata.num_dycp_reqs],
+                        get_dycp_group(),
+                        return_lse=False,
+                    )
+                    return output
                 return output
 
         # Cascade attention (rare case).

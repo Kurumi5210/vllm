@@ -47,6 +47,11 @@ class BatchDescriptor(NamedTuple):
     Whether this batch has active LoRA adapters.
     """
 
+    num_cp_tokens: int = 0
+    """
+    For cp tokens
+    """
+    
     def relax_for_mixed_batch_cudagraphs(self) -> "BatchDescriptor":
         """
         Return a relaxed version of current batch descriptor that is still compatible

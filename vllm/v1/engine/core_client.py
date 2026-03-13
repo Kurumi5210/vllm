@@ -45,6 +45,7 @@ from vllm.v1.engine.utils import (
     CoreEngineActorManager,
     CoreEngineProcManager,
     launch_core_engines,
+    launch_domain_core_engines,
 )
 from vllm.v1.executor import Executor
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
@@ -473,8 +474,11 @@ class MPClient(EngineCoreClient):
                 output_address = client_addresses["output_address"]
                 self.stats_update_address = client_addresses.get("stats_update_address")
             else:
-                # Engines are managed by this client.
-                with launch_core_engines(vllm_config, executor_class, log_stats) as (
+                with (
+                    launch_domain_core_engines(vllm_config, executor_class, log_stats) 
+                    if vllm_config.parallel_config.dp_per_domain > 1 
+                    else launch_core_engines(vllm_config, executor_class, log_stats)
+                ) as (
                     engine_manager,
                     coordinator,
                     addresses,
@@ -502,6 +506,15 @@ class MPClient(EngineCoreClient):
             dp_size = parallel_config.data_parallel_size
             dp_rank = parallel_config.data_parallel_rank
             dp_local_size = parallel_config.data_parallel_size_local
+
+            domain_size = dp_size // parallel_config.dp_per_domain
+            domain_rank = dp_rank % parallel_config.dp_per_domain
+            domain_local_size = dp_local_size // parallel_config.dp_per_domain
+
+            engine_count = dp_size // parallel_config.dp_per_domain
+            engien_rank = dp_rank // parallel_config.dp_per_domain
+            local_engine_count = dp_local_size // parallel_config.dp_per_domain
+
             offline_mode = parallel_config.data_parallel_rank_local is not None
             # Client manages local+remote EngineCores in pure internal LB case.
             # Client manages local EngineCores in hybrid and external LB case.
@@ -510,11 +523,12 @@ class MPClient(EngineCoreClient):
                 or parallel_config.data_parallel_external_lb
             )
 
-            num_ranks = dp_local_size if local_engines_only else dp_size
+            num_ranks = local_engine_count if local_engines_only else engine_count
             self.engine_ranks_managed = (
-                [dp_rank] if offline_mode else list(range(dp_rank, dp_rank + num_ranks))
+                [engien_rank] if offline_mode else list(range(engien_rank, engien_rank + num_ranks))
             )
-            assert parallel_config.data_parallel_size_local <= len(
+
+            assert local_engine_count <= len(
                 self.engine_ranks_managed
             )
 
@@ -1198,7 +1212,8 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             client_index,
         )
 
-        assert len(self.core_engines) > 1
+        if vllm_config.parallel_config.dp_per_domain == 1:
+            assert len(self.core_engines) > 1
 
         self.eng_start_index = (
             len(self.core_engines) * self.client_index

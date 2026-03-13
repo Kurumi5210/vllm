@@ -24,11 +24,11 @@ from vllm.attention.backends.abstract import (
     AttentionType,
     MultipleOf,
 )
-from vllm.attention.ops.common import cp_lse_ag_out_rs
+from vllm.attention.ops.common import cp_lse_ag_out_rs, cp_lse_ag_out_ar
 from vllm.attention.ops.merge_attn_states import merge_attn_states
 from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
-from vllm.distributed.parallel_state import get_dcp_group
+from vllm.distributed.parallel_state import get_dcp_group, get_dycp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.batch_invariant import (
     vllm_is_batch_invariant,
@@ -415,6 +415,7 @@ class FlashInferMetadata:
     qo_indptr_gpu: torch.Tensor | None = None
     paged_kv_indptr_gpu: torch.Tensor | None = None
 
+    num_dycp_reqs: int = 0
 
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     reorder_batch_threshold: int = 1
@@ -482,6 +483,17 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self.dcp_world_size = 1
             self.dcp_rank = 0
             self.dcp_kv_cache_interleave_size = 1
+        try:
+            self.dycp_world_size = get_dycp_group().world_size
+            self.dycp_rank = get_dycp_group().rank_in_group
+            self.cp_kv_cache_interleave_size = (
+                vllm_config.parallel_config.cp_kv_cache_interleave_size
+            )
+        except AssertionError:
+            # DYCP might not be initialized in testing
+            self.dycp_world_size = 1
+            self.dycp_rank = 0
+            self.cp_kv_cache_interleave_size = 1
 
         self.num_qo_heads = self.model_config.get_num_attention_heads(
             self.vllm_config.parallel_config
@@ -703,6 +715,15 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 self.dcp_rank,
                 self.dcp_kv_cache_interleave_size,
             )
+        if self.dycp_world_size > 1:
+            num_dycp_reqs = common_attn_metadata.num_dycp_reqs
+            seq_lens_cpu[:num_dycp_reqs] = get_dcp_local_seq_lens(
+                seq_lens_cpu[:num_dycp_reqs],
+                self.dycp_world_size,
+                self.dycp_rank,
+                self.cp_kv_cache_interleave_size,
+            )
+            max_seq_len = seq_lens_cpu.max().item()
 
         seq_lens_np = seq_lens_cpu.numpy()
         num_blocks_np = (seq_lens_np + (page_size - 1)) // page_size
@@ -785,7 +806,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             has_spec=uses_spec_reorder,
         )
         decode_use_trtllm = (
-            self.use_trtllm_decode_attention and self.dcp_world_size <= 1
+            self.use_trtllm_decode_attention and (self.dcp_world_size * self.dycp_world_size) <= 1
         )
 
         if not (prefill_use_trtllm and decode_use_trtllm):
@@ -829,6 +850,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
             use_cascade=use_cascade,
+            num_dycp_reqs = common_attn_metadata.num_dycp_reqs
         )
 
         paged_kv_indptr_cpu = self.paged_kv_indptr_cpu[: 1 + num_reqs]
@@ -1346,6 +1368,28 @@ class FlashInferImpl(AttentionImpl):
                         lse,
                         get_dcp_group(),
                         is_lse_base_on_e=False,
+                    )
+
+                elif self.dycp_world_size > 1:
+                    lse = torch.empty(
+                        (decode_query.size(0), decode_query.size(1)),
+                        dtype=torch.float32,
+                        device=decode_query.device,
+                    )
+                    decode_wrapper.run(
+                        decode_query,
+                        kv_cache_permute,
+                        k_scale=layer._k_scale_float,
+                        v_scale=layer._v_scale_float,
+                        out=output[:num_decode_tokens],
+                        lse=lse,
+                        return_lse=True,
+                    )
+                    output[:attn_metadata.num_dycp_reqs] = cp_lse_ag_out_ar(
+                        output[:attn_metadata.num_dycp_reqs],
+                        lse[:attn_metadata.num_dycp_reqs],
+                        get_dycp_group(),
+                        return_lse=False,
                     )
                 else:
                     decode_wrapper.run(

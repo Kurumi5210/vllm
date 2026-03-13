@@ -73,7 +73,13 @@ class WorkerBase:
         from vllm.platforms import current_platform
 
         self.current_platform = current_platform
-
+        
+        """
+        (AOCHEN): Transfer within domain rank to within dp rank
+        """
+        rank = rank % self.parallel_config.world_size
+        local_rank = local_rank % self.parallel_config.world_size
+        
         self.parallel_config.rank = rank
         self.local_rank = local_rank
         self.rank = rank

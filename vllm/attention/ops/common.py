@@ -259,6 +259,31 @@ def cp_lse_ag_out_ar(
         return out, lse
     return out
 
+def dycp_lse_out_ar(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: GroupCoordinator,
+    num_dycp_reqs: int,
+):  
+    if cp_attn_lse is None:
+        return cp_attn_out
+    lse_exp = torch.exp(cp_attn_lse)[:num_dycp_reqs]
+    lse_exp = lse_exp.unsqueeze(-1)
+    weighted_output = cp_attn_out[:num_dycp_reqs] * lse_exp
+    target_shape = weighted_output.view(lse_exp.shape[0], -1).shape
+    packed_out = torch.cat([
+                weighted_output.view(lse_exp.shape[0], -1),  # [bs, num_heads * v_head_dim]
+                lse_exp.view(lse_exp.shape[0], -1)           # [bs, num_heads]
+            ], dim=-1)
+    cp_group.all_reduce(packed_out)
+    global_weighted = packed_out[:, :target_shape[1]]
+    global_lse_sum = packed_out[:, target_shape[1]:]
+    global_weighted = global_weighted.view(weighted_output.shape)
+    global_lse_sum = global_lse_sum.view(lse_exp.shape)
+    global_output = weighted_output / lse_exp
+    cp_attn_out[:num_dycp_reqs].copy_(global_output)
+
+    return cp_attn_out
 
 @triton.jit
 def _pack_seq_kernel(

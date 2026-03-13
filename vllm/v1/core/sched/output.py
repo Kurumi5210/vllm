@@ -193,6 +193,9 @@ class SchedulerOutput:
     # freed from the encoder cache.
     free_encoder_mm_hashes: list[str]
 
+    # scheduled_tokens of each cp rank
+    cp_rank_scheduled_tokens: dict[str, int] | None = None
+
     # Request IDs that are preempted in this step.
     # Only used for v2 model runner.
     preempted_req_ids: set[str] | None = None
@@ -207,6 +210,12 @@ class SchedulerOutput:
     # EC Cache Connector metadata
     ec_connector_metadata: ECConnectorMetadata | None = None
 
+    cp_rank: int = 0
+    
+    num_cp_request: int = 0
+
+    none_tokens_in_peer_sched: bool = False
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(
@@ -219,6 +228,7 @@ class SchedulerOutput:
             num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
+            cp_rank_scheduled_tokens={},
         )
 
 

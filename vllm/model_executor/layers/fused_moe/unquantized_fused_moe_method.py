@@ -300,6 +300,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             router_logits=router_logits,
         )
 
+        if envs.VLLM_USE_FORCE_LOAD_BALANCE:
+            random_matrix = torch.rand(topk_ids.size(0),
+                                       layer.global_num_experts,
+                                       device=topk_ids.device)
+            topk_ids = torch.argsort(
+                random_matrix, dim=1)[:, :topk_ids.size(1)].to(topk_ids.dtype)
+        
         if self.rocm_aiter_moe_enabled:
             result = self.rocm_aiter_fused_experts(
                 hidden_states=x,

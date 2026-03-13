@@ -99,6 +99,12 @@ class CommonAttentionMetadata:
     _seq_lens_cpu: torch.Tensor | None = None
     _num_computed_tokens_cpu: torch.Tensor | None = None
 
+    dycp_local_seq_lens: torch.Tensor | None = None
+    dycp_local_seq_lens_cpu: torch.Tensor | None = None
+    """Sequence lengths of the local rank in dynamic decode context parallelism world"""
+
+    num_dycp_reqs: int = 0
+    
     @property
     @deprecated(
         """
@@ -1210,3 +1216,61 @@ def get_dcp_local_seq_lens(
     )
     dcp_local_seq_lens = base + remainder
     return dcp_local_seq_lens.squeeze(1)
+
+def reorder_batch_to_split_cp_and_normal(
+    input_batch: "InputBatch",
+    scheduler_output: "SchedulerOutput",
+) -> bool:
+    """Move CP-flagged requests to the front of the batch.
+       Expected order: [cp, cp, ncp, ncp], all cp is ahead of ncp
+    """
+
+    req_ids = input_batch.req_ids
+    num_reqs = len(req_ids)
+
+    # 1. Mark which requests are CP（cp_rank_scheduled_tokens[rid] > 1）
+    is_cp = np.array(
+        [scheduler_output.cp_rank_scheduled_tokens[rid] > 1 for rid in req_ids],
+        dtype=bool,
+    )
+
+    # 2. Original order: cp = 0, ncp = 1
+    # [0, 1, 0, 1] (0 = cp, 1 = ncp)
+    req_regions = np.zeros(is_cp.shape, dtype=np.int32)  # 0 = decode by default
+    req_regions[~is_cp] = 1
+
+    # 3. Calculate target positions: first CP, then non-CP
+    num_cps = int(is_cp.sum())
+    # [0, 0, 1, 1] (0 = cp, 1 = ncp)
+    target_regions = np.zeros(num_reqs, dtype=np.int32)
+    target_regions[num_cps :] = 1
+
+    # [false, true, true, false] (true represents the need to swap)
+    needs_swap = req_regions != target_regions
+
+    if not needs_swap.any():
+        return False
+    
+    # Extract indices that need swapping and sort by target region
+    # [1, 2]
+    orig_indices = np.where(needs_swap)[0]
+    # [1, 0] ---> [1, 0]
+    sorted_order = np.argsort(req_regions[needs_swap], kind="stable")
+    # [2, 1]
+    src_indices = orig_indices[sorted_order]
+    # {2:1, 1:2}
+    src_dest_map = {int(src): int(dst) for src, dst in zip(src_indices, orig_indices)}
+
+    # 4. Swap by cycles, and mark as done to avoid deadlocks
+    # Iterate key
+    for src in src_dest_map:
+        dst = src_dest_map[src]
+        # Swap alone the chain.
+        while src != dst:
+            input_batch.swap_states(src, dst)
+            # Mark dst as done by updating its destination to itself
+            next_dst = src_dest_map.get(dst, dst)
+            src_dest_map[dst] = dst
+            dst = next_dst
+
+    return True

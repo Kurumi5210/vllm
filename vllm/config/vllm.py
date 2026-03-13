@@ -537,6 +537,7 @@ class VllmConfig:
             "mp",
             "uni",
             "external_launcher",
+            "dmp",
         )
 
         if self.scheduler_config.async_scheduling:
