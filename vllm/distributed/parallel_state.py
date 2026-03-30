@@ -1315,7 +1315,20 @@ def initialize_model_parallel(
     if config is not None:
         data_parallel_size = config.parallel_config.data_parallel_size
 
-    # the layout order is: ExternalDP x DP x PP x TP
+    logger.info(
+        "chenxiao--debug init_model_parallel start: "
+        "rank=%s world_size=%s dp=%s pcp=%s pp=%s tp=%s dcp=%s backend=%s",
+        rank,
+        world_size,
+        data_parallel_size,
+        prefill_context_model_parallel_size,
+        pipeline_model_parallel_size,
+        tensor_model_parallel_size,
+        decode_context_model_parallel_size,
+        backend,
+    )
+
+    # the layout order is: ExternalDP x DP x PCP x PP x TP
     # ExternalDP is the data parallel group that is not part of the model,
     # every dp rank can generate independently (in verl integration).
     # DP is the data parallel group that is part of the model,
@@ -1327,8 +1340,8 @@ def initialize_model_parallel(
     all_ranks = torch.arange(world_size).reshape(
         -1,
         data_parallel_size,
-        pipeline_model_parallel_size,
         prefill_context_model_parallel_size,
+        pipeline_model_parallel_size,
         tensor_model_parallel_size,
     )  # noqa
 
@@ -1337,6 +1350,11 @@ def initialize_model_parallel(
     assert _TP is None, "tensor model parallel group is already initialized"
     group_ranks = all_ranks.view(-1, tensor_model_parallel_size).unbind(0)
     group_ranks = [x.tolist() for x in group_ranks]
+    logger.info(
+        "chenxiao--debug tp groups built: count=%s first_group=%s",
+        len(group_ranks),
+        group_ranks[0] if group_ranks else [],
+    )
 
     # message queue broadcaster is only used in tensor model parallel group
     _TP = init_model_parallel_group(
@@ -1356,6 +1374,11 @@ def initialize_model_parallel(
     # TP group into tp_size//dcp_size DCP groups.
     group_ranks = all_ranks.reshape(-1, decode_context_model_parallel_size).unbind(0)
     group_ranks = [x.tolist() for x in group_ranks]
+    logger.info(
+        "chenxiao--debug dcp groups built: count=%s first_group=%s",
+        len(group_ranks),
+        group_ranks[0] if group_ranks else [],
+    )
     _DCP = init_model_parallel_group(
         group_ranks,
         get_world_group().local_rank,
@@ -1367,11 +1390,16 @@ def initialize_model_parallel(
     global _PCP
     assert _PCP is None, "prefill context parallel group is already initialized"
     group_ranks = (
-        all_ranks.transpose(3, 4)
+        all_ranks.transpose(2, 4)
         .reshape(-1, prefill_context_model_parallel_size)
         .unbind(0)
     )
     group_ranks = [x.tolist() for x in group_ranks]
+    logger.info(
+        "chenxiao--debug pcp groups built: count=%s first_group=%s",
+        len(group_ranks),
+        group_ranks[0] if group_ranks else [],
+    )
     _PCP = init_model_parallel_group(
         group_ranks, get_world_group().local_rank, backend, group_name="pcp"
     )
@@ -1380,9 +1408,14 @@ def initialize_model_parallel(
     global _PP
     assert _PP is None, "pipeline model parallel group is already initialized"
     group_ranks = (
-        all_ranks.transpose(2, 4).reshape(-1, pipeline_model_parallel_size).unbind(0)
+        all_ranks.transpose(3, 4).reshape(-1, pipeline_model_parallel_size).unbind(0)
     )
     group_ranks = [x.tolist() for x in group_ranks]
+    logger.info(
+        "chenxiao--debug pp groups built: count=%s first_group=%s",
+        len(group_ranks),
+        group_ranks[0] if group_ranks else [],
+    )
     _PP = init_model_parallel_group(
         group_ranks, get_world_group().local_rank, backend, group_name="pp"
     )
@@ -1391,6 +1424,11 @@ def initialize_model_parallel(
     assert _DP is None, "data parallel group is already initialized"
     group_ranks = all_ranks.transpose(1, 4).reshape(-1, data_parallel_size).unbind(0)
     group_ranks = [x.tolist() for x in group_ranks]
+    logger.info(
+        "chenxiao--debug dp groups built: count=%s first_group=%s",
+        len(group_ranks),
+        group_ranks[0] if group_ranks else [],
+    )
     _DP = init_model_parallel_group(
         group_ranks, get_world_group().local_rank, backend, group_name="dp"
     )
@@ -1398,7 +1436,10 @@ def initialize_model_parallel(
     global _EP
     assert _EP is None, "expert parallel group is already initialized"
     group_ranks = (
-        all_ranks.transpose(1, 2)
+        # Keep EP rank order aligned with MoE flattening:
+        # flatten_tp_rank = dp_rank * (pcp_size * tp_size) + pcp_rank * tp_size + tp_rank
+        # i.e. DP x PCP x TP inside each (ExternalDP, PP) slice.
+        all_ranks.permute(0, 3, 1, 2, 4)
         .reshape(
             -1,
             data_parallel_size
@@ -1408,12 +1449,17 @@ def initialize_model_parallel(
         .unbind(0)
     )
     group_ranks = [x.tolist() for x in group_ranks]
+    logger.info(
+        "chenxiao--debug ep groups built: count=%s first_group=%s",
+        len(group_ranks),
+        group_ranks[0] if group_ranks else [],
+    )
     _EP = init_model_parallel_group(
         group_ranks, get_world_group().local_rank, backend, group_name="ep"
     )
 
     logger.info_once(
-        "rank %s in world size %s is assigned as "
+        "chenxiao--debug rank assignment: rank %s in world size %s is assigned as "
         "DP rank %s, PP rank %s, PCP rank %s, "
         "TP rank %s, EP rank %s",
         rank,
@@ -1422,6 +1468,19 @@ def initialize_model_parallel(
         _PP.rank_in_group,
         _PCP.rank_in_group,
         _TP.rank_in_group,
+        _EP.rank_in_group,
+    )
+    expected_ep_rank = (
+        _DP.rank_in_group
+        * prefill_context_model_parallel_size
+        * tensor_model_parallel_size
+        + _PCP.rank_in_group * tensor_model_parallel_size
+        + _TP.rank_in_group
+    )
+    logger.info(
+        "chenxiao--debug ep rank alignment: rank=%s expected_ep_rank=%s actual_ep_rank=%s",
+        rank,
+        expected_ep_rank,
         _EP.rank_in_group,
     )
 

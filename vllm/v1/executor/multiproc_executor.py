@@ -417,19 +417,21 @@ class MultiprocExecutor(Executor):
 
     def _get_output_rank(self) -> int:
         # Only returns ModelRunnerOutput from TP rank=0 and PP rank=-1
-        # (the first TP worker of the last PP stage).
-        # Example:
-        # Assuming TP=8, PP=4, then the world_size=32
-        # 0-7, PP rank 0
-        # 8-15, PP rank 1
-        # 16-23, PP rank 2
-        # 24-31, PP rank 3
-        # so world_size - tp_size = 32 - 8 = 24 should be PP rank = -1 (i.e. 3)
-        return (
-            self.world_size
-            - self.parallel_config.tensor_parallel_size
-            * self.parallel_config.prefill_context_parallel_size
+        # (the first TP worker of the last PP stage, on PCP rank 0).
+        output_rank = (
+            (self.parallel_config.pipeline_parallel_size - 1)
+            * self.parallel_config.tensor_parallel_size
         )
+        logger.info(
+            "chenxiao--debug multiproc output rank selected: "
+            "output_rank=%s pp=%s tp=%s pcp=%s world_size=%s",
+            output_rank,
+            self.parallel_config.pipeline_parallel_size,
+            self.parallel_config.tensor_parallel_size,
+            self.parallel_config.prefill_context_parallel_size,
+            self.world_size,
+        )
+        return output_rank
 
 
 @dataclass

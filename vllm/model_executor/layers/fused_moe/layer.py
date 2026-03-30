@@ -1931,6 +1931,10 @@ class FusedMoE(CustomOp):
                 else:
                     hidden_states_combined, router_logits = dispatch_res
 
+            x_for_moe = (
+                hidden_states_combined if do_naive_dispatch_combine else hidden_states
+            )
+
             # Run shared experts before matrix multiply.
             # because matrix multiply maybe modify the hidden_states.
             if has_separate_shared_experts and not use_shared_experts_stream:
@@ -1941,22 +1945,38 @@ class FusedMoE(CustomOp):
             # simplicity, AgRsAll2All was added separately for PCP here. Maybe
             # we should modify All2AllManager abstract to better support PCP.
             if self.pcp_size > 1:
-                # logger.info(f"chenxiao--debug use pcp all_gather")
-                hidden_states = get_pcp_group().all_gather(
-                    hidden_states,
-                    dim=0,
-                )
+                if isinstance(x_for_moe, tuple):
+                    x_for_moe = (
+                        get_pcp_group().all_gather(x_for_moe[0], dim=0),
+                        get_pcp_group().all_gather(x_for_moe[1], dim=0),
+                    )
+                else:
+                    x_for_moe = get_pcp_group().all_gather(x_for_moe, dim=0)
                 router_logits = get_pcp_group().all_gather(
                     router_logits,
                     dim=0,
                 )
 
+            x_tokens = (
+                x_for_moe[0].size(0)
+                if isinstance(x_for_moe, tuple)
+                else x_for_moe.size(0)
+            )
+            if x_tokens != router_logits.size(0):
+                logger.error(
+                    "chenxiao--debug moe token mismatch before quant apply: "
+                    "dp=%s pcp=%s do_naive_dispatch_combine=%s x_tokens=%s router_tokens=%s",
+                    self.dp_size,
+                    self.pcp_size,
+                    do_naive_dispatch_combine,
+                    x_tokens,
+                    router_logits.size(0),
+                )
+
             # Matrix multiply.
             final_hidden_states = self.quant_method.apply(
                 layer=self,
-                x=hidden_states_combined
-                if do_naive_dispatch_combine
-                else hidden_states,
+                x=x_for_moe,
                 router_logits=router_logits,
             )
 
@@ -1981,14 +2001,28 @@ class FusedMoE(CustomOp):
                 )
 
             def combine_output(states: torch.Tensor) -> torch.Tensor:
-                if do_naive_dispatch_combine:
-                    states = get_ep_group().combine(states, self.is_sequence_parallel)
-
                 if self.pcp_size > 1:
                     states = get_pcp_group().reduce_scatter(
                         states,
                         dim=0,
                     )
+
+                if do_naive_dispatch_combine:
+                    if not self.is_sequence_parallel:
+                        dp_metadata = get_forward_context().dp_metadata
+                        if dp_metadata is not None:
+                            sizes = dp_metadata.get_chunk_sizes_across_dp_rank()
+                            if sizes is not None and states.shape[0] != sum(sizes):
+                                logger.error(
+                                    "chenxiao--debug ep combine input mismatch: "
+                                    "dp=%s pcp=%s states_tokens=%s expected_tokens=%s sizes=%s",
+                                    self.dp_size,
+                                    self.pcp_size,
+                                    states.shape[0],
+                                    sum(sizes),
+                                    sizes,
+                                )
+                    states = get_ep_group().combine(states, self.is_sequence_parallel)
 
                 return states
 
