@@ -132,7 +132,31 @@ class AgRsAll2AllManager(All2AllManagerBase):
         sizes = dp_metadata.get_chunk_sizes_across_dp_rank()
         assert sizes is not None
         dist_group = get_ep_group() if is_sequence_parallel else get_dp_group()
-        assert sizes[dist_group.rank_in_group] == hidden_states.shape[0]
+        rank_in_group = dist_group.rank_in_group
+        if rank_in_group >= len(sizes):
+            logger.error(
+                "chenxiao--debug dispatch invalid size index: "
+                "is_sp=%s rank_in_group=%s len(sizes)=%s sizes=%s",
+                is_sequence_parallel,
+                rank_in_group,
+                len(sizes),
+                sizes,
+            )
+        assert rank_in_group < len(sizes)
+        expected_local_tokens = sizes[rank_in_group]
+        if expected_local_tokens != hidden_states.shape[0]:
+            logger.error(
+                "chenxiao--debug dispatch local size mismatch: "
+                "is_sp=%s rank_in_group=%s expected_local_tokens=%s "
+                "actual_hidden_tokens=%s len(sizes)=%s sizes=%s",
+                is_sequence_parallel,
+                rank_in_group,
+                expected_local_tokens,
+                hidden_states.shape[0],
+                len(sizes),
+                sizes,
+            )
+        assert expected_local_tokens == hidden_states.shape[0]
 
         tensors_to_gather = [hidden_states, router_logits]
         if extra_tensors is not None:

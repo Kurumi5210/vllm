@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable, Iterable
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from enum import Enum
 from typing import Literal, cast, get_args, overload
 
@@ -483,18 +483,6 @@ class FusedMoE(CustomOp):
             self.register_buffer("_expert_map", expert_map)
             self.register_buffer("expert_mask", expert_mask)
             self._maybe_init_expert_routing_tables()
-            logger.info_once(
-                "[EP Rank %s/%s] Expert parallelism is enabled. Expert "
-                "placement strategy: %s. Local/global"
-                " number of experts: %s/%s. Experts local to global index map:"
-                " %s.",
-                self.ep_rank,
-                self.ep_size,
-                self.expert_placement_strategy,
-                self.local_num_experts,
-                self.global_num_experts,
-                get_compressed_expert_map(self._expert_map),
-            )
         else:
             self.local_num_experts, self._expert_map, self.expert_mask = (
                 self.global_num_experts,
@@ -1882,13 +1870,79 @@ class FusedMoE(CustomOp):
         do_naive_dispatch_combine: bool = self.dp_size > 1 and not isinstance(
             self.quant_method, FusedMoEModularMethod
         )
+        # Use EP-domain all2all directly when PCP is enabled, so we don't need
+        # an extra PCP all_gather/reduce_scatter pair around MoE.
+        use_ep_domain_dispatch = do_naive_dispatch_combine and self.pcp_size > 1
+        dispatch_is_sequence_parallel = (
+            self.is_sequence_parallel or use_ep_domain_dispatch
+        )
+        # For EP-domain dispatch, hidden_states has already been split by PCP
+        # in input preparation, so we should only account for TP/SP sharding
+        # when building per-rank sizes.
+        sp_size_for_dispatch = self.sp_size if self.is_sequence_parallel else 1
+        if use_ep_domain_dispatch:
+            logger.info_once(
+                "chenxiao--debug use EP-domain dispatch/combine for MoE: "
+                "dp=%s pcp=%s tp=%s sp_size_for_dispatch=%s",
+                self.dp_size,
+                self.pcp_size,
+                self.tp_size,
+                sp_size_for_dispatch,
+            )
 
         ctx = get_forward_context()
-        sp_ctx = (
-            ctx.dp_metadata.sp_local_sizes(self.sp_size)
-            if ctx.dp_metadata
-            else nullcontext()
-        )
+        sp_ctx = nullcontext()
+        if ctx.dp_metadata:
+            if use_ep_domain_dispatch:
+                # Build sizes in EP rank order: DP x PCP x TP.
+                per_dp_tp_sizes = (
+                    (ctx.dp_metadata.num_tokens_across_dp_cpu + sp_size_for_dispatch - 1)
+                    // sp_size_for_dispatch
+                ).repeat_interleave(sp_size_for_dispatch).tolist()
+                dp_world_size = len(ctx.dp_metadata.num_tokens_across_dp_cpu)
+                ep_sizes: list[int] = []
+                for dp_rank in range(dp_world_size):
+                    tp_start = dp_rank * sp_size_for_dispatch
+                    tp_end = tp_start + sp_size_for_dispatch
+                    dp_tp_sizes = per_dp_tp_sizes[tp_start:tp_end]
+                    for _ in range(self.pcp_size):
+                        ep_sizes.extend(dp_tp_sizes)
+
+                ep_world_size = get_ep_group().world_size
+                if len(ep_sizes) != ep_world_size:
+                    logger.error(
+                        "chenxiao--debug ep dispatch size list mismatch: "
+                        "dp=%s pcp=%s tp_sp=%s ep_world=%s len(ep_sizes)=%s "
+                        "num_tokens_across_dp=%s",
+                        dp_world_size,
+                        self.pcp_size,
+                        sp_size_for_dispatch,
+                        ep_world_size,
+                        len(ep_sizes),
+                        ctx.dp_metadata.num_tokens_across_dp_cpu.tolist(),
+                    )
+
+                @contextmanager
+                def _override_ep_local_sizes():
+                    old_local_sizes = ctx.dp_metadata.local_sizes
+                    ctx.dp_metadata.local_sizes = ep_sizes
+                    try:
+                        yield ep_sizes
+                    finally:
+                        ctx.dp_metadata.local_sizes = old_local_sizes
+
+                logger.info_once(
+                    "chenxiao--debug ep dispatch sizes prepared: "
+                    "dp=%s pcp=%s tp_sp=%s ep_world=%s sample_sizes=%s",
+                    dp_world_size,
+                    self.pcp_size,
+                    sp_size_for_dispatch,
+                    ep_world_size,
+                    tuple(ep_sizes[: min(8, len(ep_sizes))]),
+                )
+                sp_ctx = _override_ep_local_sizes()
+            else:
+                sp_ctx = ctx.dp_metadata.sp_local_sizes(sp_size_for_dispatch)
 
         with sp_ctx:
             extra_tensors = None
@@ -1917,7 +1971,7 @@ class FusedMoE(CustomOp):
                 dispatch_res = get_ep_group().dispatch(
                     hidden_states_to_dispatch,
                     router_logits,
-                    self.is_sequence_parallel,
+                    dispatch_is_sequence_parallel,
                     extra_tensors=extra_tensors,
                 )
                 if extra_tensors is not None:
@@ -1931,32 +1985,52 @@ class FusedMoE(CustomOp):
                 else:
                     hidden_states_combined, router_logits = dispatch_res
 
+            x_for_moe = (
+                hidden_states_combined if do_naive_dispatch_combine else hidden_states
+            )
+
             # Run shared experts before matrix multiply.
             # because matrix multiply maybe modify the hidden_states.
             if has_separate_shared_experts and not use_shared_experts_stream:
                 assert self.shared_experts is not None
                 shared_output = self.shared_experts(hidden_states)
 
-            # NOTE: Similar with DP, PCP also needs dispatch and combine. For
-            # simplicity, AgRsAll2All was added separately for PCP here. Maybe
-            # we should modify All2AllManager abstract to better support PCP.
-            if self.pcp_size > 1:
-                # logger.info(f"chenxiao--debug use pcp all_gather")
-                hidden_states = get_pcp_group().all_gather(
-                    hidden_states,
-                    dim=0,
-                )
+            # Fallback path: when not using EP-domain dispatch, we still need
+            # PCP gather/scatter around MoE.
+            if self.pcp_size > 1 and not use_ep_domain_dispatch:
+                assert(0)
+                if isinstance(x_for_moe, tuple):
+                    x_for_moe = (
+                        get_pcp_group().all_gather(x_for_moe[0], dim=0),
+                        get_pcp_group().all_gather(x_for_moe[1], dim=0),
+                    )
+                else:
+                    x_for_moe = get_pcp_group().all_gather(x_for_moe, dim=0)
                 router_logits = get_pcp_group().all_gather(
                     router_logits,
                     dim=0,
                 )
 
+            x_tokens = (
+                x_for_moe[0].size(0)
+                if isinstance(x_for_moe, tuple)
+                else x_for_moe.size(0)
+            )
+            if x_tokens != router_logits.size(0):
+                logger.error(
+                    "chenxiao--debug moe token mismatch before quant apply: "
+                    "dp=%s pcp=%s do_naive_dispatch_combine=%s x_tokens=%s router_tokens=%s",
+                    self.dp_size,
+                    self.pcp_size,
+                    do_naive_dispatch_combine,
+                    x_tokens,
+                    router_logits.size(0),
+                )
+
             # Matrix multiply.
             final_hidden_states = self.quant_method.apply(
                 layer=self,
-                x=hidden_states_combined
-                if do_naive_dispatch_combine
-                else hidden_states,
+                x=x_for_moe,
                 router_logits=router_logits,
             )
 
@@ -1981,13 +2055,30 @@ class FusedMoE(CustomOp):
                 )
 
             def combine_output(states: torch.Tensor) -> torch.Tensor:
-                if do_naive_dispatch_combine:
-                    states = get_ep_group().combine(states, self.is_sequence_parallel)
-
-                if self.pcp_size > 1:
+                if self.pcp_size > 1 and not use_ep_domain_dispatch:
+                    assert(0)
                     states = get_pcp_group().reduce_scatter(
                         states,
                         dim=0,
+                    )
+
+                if do_naive_dispatch_combine:
+                    if not dispatch_is_sequence_parallel:
+                        dp_metadata = get_forward_context().dp_metadata
+                        if dp_metadata is not None:
+                            sizes = dp_metadata.get_chunk_sizes_across_dp_rank()
+                            if sizes is not None and states.shape[0] != sum(sizes):
+                                logger.error(
+                                    "chenxiao--debug ep combine input mismatch: "
+                                    "dp=%s pcp=%s states_tokens=%s expected_tokens=%s sizes=%s",
+                                    self.dp_size,
+                                    self.pcp_size,
+                                    states.shape[0],
+                                    sum(sizes),
+                                    sizes,
+                                )
+                    states = get_ep_group().combine(
+                        states, dispatch_is_sequence_parallel
                     )
 
                 return states
