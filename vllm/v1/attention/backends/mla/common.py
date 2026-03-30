@@ -538,7 +538,8 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             # which would result in up-projected context being
             #   2*(192*128)*(64*1024) = 3gb
             # (assuming 192 QK head dim, 128 heads, and fp16)
-            64 * 1024,
+            # 64 * 1024,
+            524288,
         )
 
         # Enforce that we enough for at least 1 page per request
@@ -1397,13 +1398,25 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
         self.dcp_rank: int | None = None
         self.pcp_rank: int | None = None
 
+        vllm_config = get_current_vllm_config()
         self.chunked_prefill_workspace_size = (
             MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size(
-                get_current_vllm_config()
+                vllm_config
             )
         )
         self.cp_kv_cache_interleave_size: int = (
-            get_current_vllm_config().parallel_config.cp_kv_cache_interleave_size
+            vllm_config.parallel_config.cp_kv_cache_interleave_size
+        )
+        # Save for profile run memory estimation
+        self.max_num_batched_tokens: int = (
+            vllm_config.scheduler_config.max_num_batched_tokens
+        )
+        logger.info(f"max_num_batched_tokens: {self.max_num_batched_tokens}")
+        self.pcp_world_size_config: int = (
+            vllm_config.parallel_config.prefill_context_parallel_size
+        )
+        self.dcp_world_size_config: int = (
+            vllm_config.parallel_config.decode_context_parallel_size
         )
 
     def _flash_attn_varlen_diff_headdims(
@@ -2107,18 +2120,154 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             )
 
         if attn_metadata is None:
-            # During the profile run try to simulate to worse case output size
-            # for `self.kv_b_proj(kv_c_normed)` in `_compute_prefill_context`
-            # since this can be large
-            _ = torch.empty(
+            # === Profile run: simulate peak memory for CUDA allocator ===
+            # We allocate temporary tensors to let PyTorch CUDA memory
+            # allocator record the correct peak, reserving space for KV cache.
+
+            # --- Path 1: Context path (chunked prefill context chunks) ---
+            # In _context_parallel_compute_prefill_context, each chunk does:
+            #   local_gather toks <= workspace_size // (cp_world_size + 1)
+            #   all-gather => toks * cp_world_size
+            #   kv_b_proj output: [toks * cp_world_size, num_heads, P+V]
+            # So the max kv_b_proj input size is:
+            #   workspace_size * cp_world_size / (cp_world_size + 1)
+            # Note: cp_world_size = dcp_world_size * pcp_world_size in actual
+            # inference (see _forward_prefill).
+            cp_world_size = (
+                self.dcp_world_size_config * self.pcp_world_size_config
+            )
+            if cp_world_size > 1:
+                context_kv_tokens = (
+                    self.chunked_prefill_workspace_size
+                    * cp_world_size
+                    // (cp_world_size + 1)
+                )
+            else:
+                context_kv_tokens = self.chunked_prefill_workspace_size
+
+            _ctx_kv_proj = torch.empty(
                 (
-                    self.chunked_prefill_workspace_size,
+                    context_kv_tokens,
                     self.num_heads,
                     self.qk_nope_head_dim + self.v_head_dim,
                 ),
                 device=k_c_normed.device,
                 dtype=k_c_normed.dtype,
             )
+            del _ctx_kv_proj
+
+            # --- Path 2: New tokens path (PCP mode) ---
+            # In _forward_prefill, the new tokens path processes:
+            #   kv_b_proj on all-gathered kv_c_normed
+            #   _concat_k_nope_k_pe
+            #   fused_pcp_qkv_select (6 output tensors)
+            # These tensors are alive simultaneously during the call.
+            if self.pcp_world_size is None:
+                try:
+                    self.pcp_world_size = get_pcp_group().world_size
+                except AssertionError:
+                    self.pcp_world_size = 1
+
+            if self.pcp_world_size > 1:
+                # profile_run passes max_num_batched_tokens // pcp_world_size
+                # tokens per rank. In actual inference, kv_c_normed is
+                # all-gathered to total = max_num_batched_tokens tokens.
+                per_rank_tokens = (
+                    self.max_num_batched_tokens // self.pcp_world_size
+                )
+                total_kv_tokens = per_rank_tokens * self.pcp_world_size
+
+                # In fused_pcp_qkv_select, q.size(0) = per_rank_tokens
+                # (the per-rank prefill token count, NOT total_kv_tokens).
+                half_q = per_rank_tokens // 2
+
+                # Simulate tensors that are alive simultaneously in
+                # _forward_prefill's new tokens path:
+                #
+                # 1. kv_b_proj output (kv_nope):
+                #    [total_kv_tokens, num_heads, qk_nope_head_dim + v_head_dim]
+                #    This stays alive because k_nope and v are views into it.
+                _kv_proj = torch.empty(
+                    (
+                        total_kv_tokens,
+                        self.num_heads,
+                        self.qk_nope_head_dim + self.v_head_dim,
+                    ),
+                    device=k_c_normed.device,
+                    dtype=k_c_normed.dtype,
+                )
+
+                # 2. _concat_k_nope_k_pe output (k):
+                #    [total_kv_tokens, num_heads, qk_nope_head_dim + qk_rope_head_dim]
+                _k_concat = torch.empty(
+                    (
+                        total_kv_tokens,
+                        self.num_heads,
+                        self.qk_nope_head_dim + self.qk_rope_head_dim,
+                    ),
+                    device=k_c_normed.device,
+                    dtype=k_c_normed.dtype,
+                )
+
+                # 3. fused_pcp_qkv_select outputs (6 tensors, worst case):
+                #    q_head: [half_q, num_heads, qk_head_dim]
+                #    q_tail: [half_q, num_heads, qk_head_dim]
+                _q_head = torch.empty(
+                    (half_q, self.num_heads, self.qk_head_dim),
+                    device=k_c_normed.device,
+                    dtype=k_c_normed.dtype,
+                )
+                _q_tail = torch.empty(
+                    (half_q, self.num_heads, self.qk_head_dim),
+                    device=k_c_normed.device,
+                    dtype=k_c_normed.dtype,
+                )
+
+                #    k_head worst case (pcp_rank = pcp_world_size - 1):
+                #      [half_q * pcp_world_size, num_heads, qk_head_dim]
+                #    v_head worst case:
+                #      [half_q * pcp_world_size, num_heads, v_head_dim]
+                k_head_len = half_q * self.pcp_world_size
+                _k_head = torch.empty(
+                    (k_head_len, self.num_heads, self.qk_head_dim),
+                    device=k_c_normed.device,
+                    dtype=k_c_normed.dtype,
+                )
+                _v_head = torch.empty(
+                    (k_head_len, self.num_heads, self.v_head_dim),
+                    device=k_c_normed.device,
+                    dtype=k_c_normed.dtype,
+                )
+
+                #    k_tail worst case (pcp_rank = 0):
+                #      [half_q * 2 * pcp_world_size, num_heads, qk_head_dim]
+                #    v_tail worst case:
+                #      [half_q * 2 * pcp_world_size, num_heads, v_head_dim]
+                k_tail_len = half_q * 2 * self.pcp_world_size
+                _k_tail = torch.empty(
+                    (k_tail_len, self.num_heads, self.qk_head_dim),
+                    device=k_c_normed.device,
+                    dtype=k_c_normed.dtype,
+                )
+                _v_tail = torch.empty(
+                    (k_tail_len, self.num_heads, self.v_head_dim),
+                    device=k_c_normed.device,
+                    dtype=k_c_normed.dtype,
+                )
+
+                # All tensors above are alive simultaneously at this point,
+                # which correctly simulates the peak memory during actual
+                # inference. Now release them all at once.
+                del (
+                    _kv_proj,
+                    _k_concat,
+                    _q_head,
+                    _q_tail,
+                    _k_head,
+                    _v_head,
+                    _k_tail,
+                    _v_tail,
+                )
 
             # The zero fill is required when used with DP + EP
             # to ensure all ranks within a DP group compute the

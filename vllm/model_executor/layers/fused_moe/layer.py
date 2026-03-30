@@ -1941,6 +1941,7 @@ class FusedMoE(CustomOp):
             # simplicity, AgRsAll2All was added separately for PCP here. Maybe
             # we should modify All2AllManager abstract to better support PCP.
             if self.pcp_size > 1:
+                # logger.info(f"chenxiao--debug use pcp all_gather")
                 hidden_states = get_pcp_group().all_gather(
                     hidden_states,
                     dim=0,

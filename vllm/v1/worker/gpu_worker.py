@@ -446,9 +446,11 @@ class Worker(WorkerBase):
                     warmup_sizes.append(compile_range.end)
 
         # We skip EPLB here since we don't want to record dummy metrics
+        pcp_world_size = self.parallel_config.prefill_context_parallel_size
         for size in sorted(warmup_sizes, reverse=True):
-            logger.info("Compile and warming up model for size %d", size)
-            self.model_runner._dummy_run(size, skip_eplb=True, remove_lora=False)
+            actual_size = size // pcp_world_size if pcp_world_size > 1 else size
+            logger.info("Compile and warming up model for size %d (actual %d with pcp_world_size=%d)", size, actual_size, pcp_world_size)
+            self.model_runner._dummy_run(actual_size, skip_eplb=True, remove_lora=False)
         self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)
 
         # Warmup and tune the kernels used during model execution before
