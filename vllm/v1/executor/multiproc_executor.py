@@ -69,9 +69,13 @@ class FutureWrapper(Future):
         self,
         futures_queue: deque[tuple["FutureWrapper", Callable]],
         aggregate: Callable = lambda x: x,
+        method = None,
+        output_ranks = None
     ):
         self.futures_queue = futures_queue
         self.aggregate = aggregate
+        self.method = method
+        self.output_ranks = output_ranks
         super().__init__()
 
     def result(self, timeout=None):
@@ -86,6 +90,8 @@ class FutureWrapper(Future):
     def wait_for_response(self, get_response: Callable):
         try:
             response = self.aggregate(get_response())
+            if self.method in ("execute_model", "sample_tokens"):
+                response = [response[idx] for idx in self.output_ranks]
             with suppress(InvalidStateError):
                 self.set_result(response)
         except Exception as e:
@@ -535,8 +541,8 @@ class DomainMultiprocExecutor(MultiprocExecutor):
                 ):
                     logger.info(
                         "Woker Rank Info: local_rank=%d, rank=%d, global_dp_rank=%d, local_dp_rank=%d, visabel device=%s",
-                        local_rank, global_rank, 
-                        self.vllm_config.parallel_config.data_parallel_rank, 
+                        local_rank, global_rank,
+                        self.vllm_config.parallel_config.data_parallel_rank,
                         self.vllm_config.parallel_config.data_parallel_rank_local,
                         os.environ.get(current_platform.device_control_env_var, "Not Set Yet")
                     )
@@ -669,12 +675,10 @@ class DomainMultiprocExecutor(MultiprocExecutor):
                     )
                 responses.append(result)
 
-            if method in ("execute_model", "sample_tokens"):
-                return [responses[idx] for idx in self.output_ranks]
             return responses[0] if output_rank is not None else responses
 
         if non_block:
-            future = FutureWrapper(self.futures_queue, aggregate=aggregate)
+            future = FutureWrapper(self.futures_queue, aggregate=aggregate, method=method, output_ranks=self.output_ranks)
             self.futures_queue.appendleft((future, get_response))
             return future
 
@@ -683,7 +687,12 @@ class DomainMultiprocExecutor(MultiprocExecutor):
             future, get_fut_response = self.futures_queue.pop()
             future.wait_for_response(get_fut_response)
 
-        return aggregate(get_response())
+        outputs = aggregate(get_response())
+        if method in ("execute_model", "sample_tokens"):
+            output = [outputs[idx] for idx in self.output_ranks]
+            return output
+
+        return outputs
 
     def execute_model(  # type: ignore[override]
         self, scheduler_outputs: list[SchedulerOutput], non_block: bool = False
@@ -691,7 +700,7 @@ class DomainMultiprocExecutor(MultiprocExecutor):
         return self.collective_rpc(
             "execute_model",
             args=(scheduler_outputs,),
-            # unique_reply_rank=self.output_rank,
+            unique_reply_rank=self.output_rank,
             non_block=non_block,
             timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
             kv_output_aggregator=self.kv_output_aggregator,
@@ -704,7 +713,7 @@ class DomainMultiprocExecutor(MultiprocExecutor):
         return self.collective_rpc(
             "sample_tokens",
             args=(grammar_output,),
-            # unique_reply_rank=self.output_rank,
+            unique_reply_rank=self.output_rank,
             non_block=non_block,
             timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
             kv_output_aggregator=self.kv_output_aggregator,
