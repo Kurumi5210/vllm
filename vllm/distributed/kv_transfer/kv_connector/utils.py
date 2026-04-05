@@ -185,13 +185,16 @@ class KVOutputAggregator:
             set_name: str = "",
             req_id_to_cp_size: dict[str, int] = None,
         ) -> None:
+            print(f'>>>>>>> req_ids: {req_ids}')
+            logger.info(f"chenxiao--debug req_id:{req_ids}; req_id_to_cp_size:{req_id_to_cp_size}")
             for req_id in req_ids or ():
-                assert req_id in req_id_to_cp_size
-                cp_size = req_id_to_cp_size[req_id]
+                # assert req_id in req_id_to_cp_size
+                cp_size = req_id_to_cp_size[req_id] if req_id_to_cp_size is not None else 1
                 remaining_count = remaining_count_dict.get(
                     req_id, self._expected_finished_count * cp_size
                 )
                 remaining_count_dict[req_id] = remaining_count - 1
+                logger.info(f'>>>>>>> remaining_count_dict[req_id]: {remaining_count_dict[req_id]}, self._expected_finished_count: {self._expected_finished_count}, cp_size: {cp_size}')
 
                 # 检测重复通知
                 if req_id in finished_set:
@@ -213,12 +216,15 @@ class KVOutputAggregator:
         aggregated_kv_connector_stats = None
         combined_kv_cache_events = None
         invalid_block_ids = set[int]()
+        print(f'>>>>>>> output_len: {len(outputs)}, outputs: {outputs}')
         for model_runner_output in outputs:
             # assert model_runner_output is not None
             if not isinstance(model_runner_output, ModelRunnerOutput):
+                print(f'>>>>>>> get in 000')
                 continue
             kv_output = model_runner_output.kv_connector_output
             if not kv_output:
+                print(f'>>>>>>> get in 111')
                 continue
             # Allow the worker to dynamically update the expected number of
             # finished sending/recving for new requests.
@@ -235,11 +241,11 @@ class KVOutputAggregator:
 
             update_finished_set(
                 kv_output.finished_sending, self._send_remaining_count, finished_sending,
-                set_name="finished_sending", req_id_to_cp_size=model_runner_output.req_id_to_cp_size,
+                set_name="finished_sending", req_id_to_cp_size=model_runner_output.kv_connector_output.req_id_to_cp_size,
             )
             update_finished_set(
                 kv_output.finished_recving, self._recv_remaining_count, finished_recving,
-                set_name="finished_recving", req_id_to_cp_size=model_runner_output.req_id_to_cp_size,
+                set_name="finished_recving", req_id_to_cp_size=model_runner_output.kv_connector_output.req_id_to_cp_size,
             )
 
             # Aggregate kv_connector_stats from all workers.
