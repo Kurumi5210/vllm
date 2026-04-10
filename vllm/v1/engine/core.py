@@ -945,10 +945,18 @@ class EngineCoreProc(EngineCore):
             yield
             return
         self._iteration_index = getattr(self, "_iteration_index", 0)
-        if isinstance(scheduler_outputs,list):
-            for sched_out in scheduler_outputs:
-                if sched_out is False:
-                    continue
+        if isinstance(scheduler_outputs, list):
+            # Find the first valid scheduler output for logging
+            sched_out = None
+            for so in scheduler_outputs:
+                if so is not False and so is not None:
+                    sched_out = so
+                    break
+
+            if sched_out is None:
+                yield
+                self._iteration_index += 1
+                return
 
             iteration_details = compute_iteration_details(sched_out)
             before = time.monotonic()
@@ -1397,6 +1405,13 @@ class EngineCoreProc(EngineCore):
             self.output_queue.put_nowait(
                 (client_idx, EngineCoreOutputs(utility_output=output))
             )
+        elif request_type == EngineCoreRequestType.START_DP_WAVE:
+            # In domain-parallel non-MoE setups, plain EngineCoreProc is
+            # used instead of DomainEngineCoreProc but the coordinator
+            # still sends START_DP_WAVE.  Safe to ignore because this
+            # engine core has no wave/pause mechanism — it is always
+            # running.
+            pass
         elif request_type == EngineCoreRequestType.EXECUTOR_FAILED:
             raise RuntimeError("Executor failed.")
         else:
@@ -1958,9 +1973,11 @@ class DomainEngineCoreProc(DPEngineCoreProc):
 
         assert domain_count > 1
         assert local_domain_rank is not None
-        assert 0 <= local_domain_rank <= domain_rank < domain_count
-        
+        assert 0 <= local_domain_rank < domain_count
+        assert 0 <= domain_rank < domain_count
+
         self.domain_rank = domain_rank
+        self.step_counter = 0
         logger.info(f"Domain rank: {self.domain_rank} start to init statelss domain group")
         self.domain_group = vllm_config.parallel_config.stateless_init_domain_group()
 

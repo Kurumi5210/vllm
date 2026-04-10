@@ -595,8 +595,6 @@ class RandomDataset(BenchmarkDataset):
         input_lens = np.array(input_lens)
         output_lens = np.array(output_lens)
         offsets = self._rng.integers(0, tokenizer.vocab_size, size=num_requests)
-        print(f"input_lens: {input_lens}")
-        print(f"output_lens: {output_lens}")
         return input_lens, output_lens, offsets
 
     def get_sampling_params(

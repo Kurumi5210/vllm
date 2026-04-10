@@ -53,6 +53,19 @@ class KVOutputAggregator:
         self._send_remaining_count = dict[str, int]()
         self._expected_finished_count = expected_finished_count
 
+        # Track fully aggregated request IDs to prevent double-counting
+        # when the same request's reports appear in both execute_model
+        # and sample_tokens aggregate_domain calls.
+        self._completed_send_ids: set[str] = set()
+        self._completed_recv_ids: set[str] = set()
+
+        # Carry-forward mechanism: when a request completes in an
+        # execute_model aggregate_domain call (whose result the scheduler
+        # does NOT read), carry it to the next sample_tokens aggregate
+        # call so the scheduler sees it. TTL=1 means carry for 1 call.
+        self._pending_send: dict[str, int] = {}  # req_id -> TTL
+        self._pending_recv: dict[str, int] = {}  # req_id -> TTL
+
     @classmethod
     def from_connector(cls, connector: "KVConnectorBase", world_size: int):
         return cls(connector.get_finished_count() or world_size)
@@ -182,11 +195,18 @@ class KVOutputAggregator:
             req_ids: set[str] | None,
             remaining_count_dict: dict[str, int],
             finished_set: set[str],
+            completed_ids: set[str],
             set_name: str = "",
             req_id_to_cp_size: dict[str, int] = None,
         ) -> None:
 
             for req_id in req_ids or ():
+                # Skip requests that already completed in a previous
+                # aggregate_domain call. This prevents the remaining count
+                # from being re-initialized after deletion.
+                if req_id in completed_ids:
+                    continue
+
                 cp_size = req_id_to_cp_size[req_id] if req_id_to_cp_size is not None else 1
                 remaining_count = remaining_count_dict.get(
                     req_id, self._expected_finished_count * cp_size
@@ -206,10 +226,34 @@ class KVOutputAggregator:
                         set_name, req_id
                     )
                     finished_set.add(req_id)
+                    completed_ids.add(req_id)
                     del remaining_count_dict[req_id]
 
-        finished_sending = set[str]()
-        finished_recving = set[str]()
+        # Carry forward pending completions from previous aggregate_domain
+        # call. When execute_model and sample_tokens are separate RPCs,
+        # a request may complete in the execute_model aggregate (whose
+        # result the scheduler doesn't read). Carry it to the sample_tokens
+        # aggregate so the scheduler sees it.
+        carried_sending: set[str] = set()
+        carried_recving: set[str] = set()
+        for req_id, ttl in list(self._pending_send.items()):
+            carried_sending.add(req_id)
+            if ttl <= 1:
+                del self._pending_send[req_id]
+                # Clean up completed tracking — all reports consumed
+                self._completed_send_ids.discard(req_id)
+            else:
+                self._pending_send[req_id] = ttl - 1
+        for req_id, ttl in list(self._pending_recv.items()):
+            carried_recving.add(req_id)
+            if ttl <= 1:
+                del self._pending_recv[req_id]
+                self._completed_recv_ids.discard(req_id)
+            else:
+                self._pending_recv[req_id] = ttl - 1
+
+        finished_sending = set(carried_sending)
+        finished_recving = set(carried_recving)
         aggregated_kv_connector_stats = None
         combined_kv_cache_events = None
         invalid_block_ids = set[int]()
@@ -233,12 +277,25 @@ class KVOutputAggregator:
                 )
                 self._expected_finished_count = kv_output.expected_finished_count
 
+            if kv_output.finished_sending or kv_output.finished_recving:
+                logger.info(
+                    "chenxiao--debug aggregate_domain worker_idx=%d, "
+                    "finished_sending=%s, finished_recving=%s, "
+                    "req_id_to_cp_size=%s, is_none=%s",
+                    outputs.index(model_runner_output),
+                    kv_output.finished_sending,
+                    kv_output.finished_recving,
+                    dict(model_runner_output.kv_connector_output.req_id_to_cp_size),
+                    model_runner_output.kv_connector_output.req_id_to_cp_size is None,
+                )
             update_finished_set(
                 kv_output.finished_sending, self._send_remaining_count, finished_sending,
+                self._completed_send_ids,
                 set_name="finished_sending", req_id_to_cp_size=model_runner_output.kv_connector_output.req_id_to_cp_size,
             )
             update_finished_set(
                 kv_output.finished_recving, self._recv_remaining_count, finished_recving,
+                self._completed_recv_ids,
                 set_name="finished_recving", req_id_to_cp_size=model_runner_output.kv_connector_output.req_id_to_cp_size,
             )
 
@@ -271,6 +328,28 @@ class KVOutputAggregator:
                 combined_kv_cache_events.increment_workers(1)
 
             invalid_block_ids |= kv_output.invalid_block_ids
+
+        # Save NEW completions (not carried-forward) to pending for the
+        # next aggregate_domain call, with TTL=1 (carry once).
+        for req_id in finished_sending - carried_sending:
+            self._pending_send[req_id] = 1
+        for req_id in finished_recving - carried_recving:
+            self._pending_recv[req_id] = 1
+
+        if finished_sending or finished_recving:
+            logger.info(
+                "chenxiao--debug aggregate_domain RESULT "
+                "finished_sending=%s, finished_recving=%s, "
+                "send_remaining=%s, recv_remaining=%s, "
+                "carried_send=%s, carried_recv=%s, "
+                "pending_send=%s, pending_recv=%s",
+                finished_sending, finished_recving,
+                dict(self._send_remaining_count),
+                dict(self._recv_remaining_count),
+                carried_sending, carried_recving,
+                dict(self._pending_send),
+                dict(self._pending_recv),
+            )
 
         # select output of the worker specified by output_rank
         # output = outputs[output_rank]

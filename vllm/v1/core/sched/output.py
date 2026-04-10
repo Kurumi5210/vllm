@@ -245,7 +245,7 @@ class SchedulerOutput:
 
     num_cp_request: int = 0
 
-    req_id_to_cp_size: dict[str, list[int]] | None = None
+    req_id_to_cp_size: dict[str, int] | None = None
 
     none_tokens_in_peer_sched: bool = False
 

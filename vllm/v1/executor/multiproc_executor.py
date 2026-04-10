@@ -95,6 +95,10 @@ class FutureWrapper(Future):
             with suppress(InvalidStateError):
                 self.set_result(response)
         except Exception as e:
+            logger.error(
+                "chenxiao--debug FutureWrapper exception in %s: %s",
+                self.method, e, exc_info=True,
+            )
             with suppress(InvalidStateError):
                 self.set_exception(e)
 
