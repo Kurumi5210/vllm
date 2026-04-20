@@ -77,7 +77,7 @@ class KVOutputAggregator:
                 )
                 remaining_count_dict[req_id] = remaining_count - 1
 
-                # 检测重复通知
+                # check duplicate notification
                 if req_id in finished_set:
                     logger.warning(
                         "[%s] Request %s already in finished_set, duplicate notification detected",
@@ -177,7 +177,6 @@ class KVOutputAggregator:
             return outputs
 
         # Aggregate kv_connector_output from all workers
-
         def update_finished_set(
             req_ids: set[str] | None,
             remaining_count_dict: dict[str, int],
@@ -193,7 +192,7 @@ class KVOutputAggregator:
                 )
                 remaining_count_dict[req_id] = remaining_count - 1
 
-                # 检测重复通知
+                # check duplicate notification
                 if req_id in finished_set:
                     logger.warning(
                         "[%s] Request %s already in finished_set, duplicate notification detected",
@@ -272,11 +271,7 @@ class KVOutputAggregator:
 
             invalid_block_ids |= kv_output.invalid_block_ids
 
-        # select output of the worker specified by output_rank
-        # output = outputs[output_rank]
-
         for output in outputs:
-            # assert output is not None
             if not isinstance(output, ModelRunnerOutput):
                 continue
             output.kv_connector_output = KVConnectorOutput(
