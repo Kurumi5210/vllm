@@ -996,7 +996,7 @@ class CrossDPScheduler(Scheduler):
                         # we can stop the scheduling here.
                         break
 
-                    if num_new_tokens <= 0 and self.waiting.is_long_request(request):
+                    if effective_budget <= 0 and self.waiting.is_long_request(request):
                         # CP request too large — skip it and keep
                         # looking for shorter DP requests.
                         self.waiting.pop_request()
