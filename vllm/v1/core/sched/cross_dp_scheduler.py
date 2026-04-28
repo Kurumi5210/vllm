@@ -76,34 +76,7 @@ class RequestManager:
             num_buckets=self.cp_world_size,
             max_length=long_request_threshold)
 
-    # def select_dp(self, request: Request, is_long: bool, num_new_tokens: int, rank_budgets: list) -> list[int] | None:
-    #     if len(request.cp_ranks) > 0:
-    #         if all([self.num_req_per_dp[rank] < self.max_num_seqs for rank in request.cp_ranks]):
-    #             return request.cp_ranks
-    #         else:
-    #             return None
-
-    #     if is_long:
-    #         return [
-    #             i for i in range(self.cp_world_size)
-    #         ]
-    #     else:
-    #         # Get the the dp with the least number of requests
-    #         # best_dp = min(range(len(self.num_req_per_dp)), key=lambda i: self.num_req_per_dp[i])
-    #         best_dp = self.balancer.dispatch_task_without_id(num_new_tokens)
-    #         if rank_budgets[best_dp] < num_new_tokens:
-    #             if num_new_tokens not in rank_budgets:
-    #                 return None
-    #             best_dp = rank_budgets.index(num_new_tokens)
-    #         return [best_dp]
-
-    def select_dp(self, request: Request, is_long: bool) -> list[int] | None:
-        if len(request.cp_ranks) > 0:
-            if all([self.num_req_per_dp[rank] < self.max_num_seqs for rank in request.cp_ranks]):
-                return request.cp_ranks
-            else:
-                return None
-
+    def select_dp(self, request: Request, is_long: bool, num_new_tokens: int, rank_budgets:list) -> list[int] | None:
         if is_long:
             return [
                 i for i in range(self.cp_world_size)
@@ -111,6 +84,11 @@ class RequestManager:
         else:
             # Get the the dp with the least number of requests
             best_dp = min(range(len(self.num_req_per_dp)), key=lambda i: self.num_req_per_dp[i])
+            if rank_budgets[best_dp] < num_new_tokens:
+                max_budget = max(rank_budgets)
+                if num_new_tokens > max_budget:
+                    return None
+                best_dp = rank_budgets.index(max_budget)
             return [best_dp]
 
     def add_req(self, request: Request) -> None:
@@ -837,6 +815,7 @@ class CrossDPScheduler(Scheduler):
                     if len(preempted_req.cp_ranks) > 1:
                         raise RuntimeError("Preempted request has multiple CP ranks is not supported now.")
 
+                    preempted_req.cp_ranks = []
                     for rank in preempted_req.cp_ranks:
                         preempted_reqs[rank].append(preempted_req)
 
@@ -1036,15 +1015,15 @@ class CrossDPScheduler(Scheduler):
                     selected_dp = self.request_manager.select_dp(
                         request,
                         self.waiting.is_long_request(request),
-                        # num_new_tokens,
-                        # rank_budgets,
+                        num_new_tokens,
+                        rank_budgets,
                     )
                 else:
                     selected_dp = self.request_manager.select_dp(
                         request,
                         self.waiting.is_long_request(request),
-                        # num_new_tokens,
-                        # rank_budgets,
+                        num_new_tokens,
+                        rank_budgets,
                     )
                 if selected_dp is None:
                     break
