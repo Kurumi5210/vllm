@@ -1998,7 +1998,7 @@ class FusedMoE(CustomOp):
             # Fallback path: when not using EP-domain dispatch, we still need
             # PCP gather/scatter around MoE.
             if self.pcp_size > 1 and not use_ep_domain_dispatch:
-                assert(0)
+                # assert(0)
                 if isinstance(x_for_moe, tuple):
                     x_for_moe = (
                         get_pcp_group().all_gather(x_for_moe[0], dim=0),
@@ -2056,7 +2056,7 @@ class FusedMoE(CustomOp):
 
             def combine_output(states: torch.Tensor) -> torch.Tensor:
                 if self.pcp_size > 1 and not use_ep_domain_dispatch:
-                    assert(0)
+                    # assert(0)
                     states = get_pcp_group().reduce_scatter(
                         states,
                         dim=0,

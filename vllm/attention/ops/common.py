@@ -502,9 +502,19 @@ def _fused_pcp_qkv_select_kernel(
     dim_block_id = tl.program_id(2)
     dim_off = tl.arange(0, DIM_BLOCK_SIZE) + dim_block_id * DIM_BLOCK_SIZE
 
-    q_start_loc = tl.load(query_start_ptr + req_id)
-    q_end_loc = tl.load(query_start_ptr + req_id + 1)
+    q_start_loc = tl.load(query_start_ptr + req_id).to(tl.int64)
+    q_end_loc = tl.load(query_start_ptr + req_id + 1).to(tl.int64)
     q_select_len = (q_end_loc - q_start_loc) // 2
+
+    # Cast strides to int64 to avoid overflow in pointer arithmetic
+    q_stride_B_i64 = q_stride_B.to(tl.int64)
+    q_stride_H_i64 = q_stride_H.to(tl.int64)
+    k_stride_B_i64 = k_stride_B.to(tl.int64)
+    k_stride_H_i64 = k_stride_H.to(tl.int64)
+    v_stride_B_i64 = v_stride_B.to(tl.int64)
+    v_stride_H_i64 = v_stride_H.to(tl.int64)
+    head_id_i64 = head_id.to(tl.int64)
+    dim_off_i64 = dim_off.to(tl.int64)
 
     # Select Q
     if seq_block_id < 2:
@@ -513,20 +523,20 @@ def _fused_pcp_qkv_select_kernel(
         for qi in range(tl.cdiv(q_select_len, SEQ_BLOCK_SIZE)):
             q_offset = tl.arange(0, SEQ_BLOCK_SIZE) + qi * SEQ_BLOCK_SIZE
             mask = (dim_off[None, :] < q_head_dim) & (q_offset[:, None] < q_select_len)
-            q_src_idx = block_q_start_loc + q_offset[:, None]
-            q_dst_idx = q_start_loc // 2 + q_offset[:, None]
+            q_src_idx = (block_q_start_loc + q_offset[:, None]).to(tl.int64)
+            q_dst_idx = (q_start_loc // 2 + q_offset[:, None]).to(tl.int64)
             q_val = tl.load(
                 q_ptr
-                + q_src_idx * q_stride_B
-                + head_id * q_stride_H
-                + dim_off[None, :],
+                + q_src_idx * q_stride_B_i64
+                + head_id_i64 * q_stride_H_i64
+                + dim_off_i64[None, :],
                 mask=mask,
             )
             tl.store(
                 out_ptr
-                + q_dst_idx * n_head * q_head_dim
-                + head_id * q_head_dim
-                + dim_off[None, :],
+                + q_dst_idx * tl.cast(n_head * q_head_dim, tl.int64)
+                + head_id_i64 * tl.cast(q_head_dim, tl.int64)
+                + dim_off_i64[None, :],
                 q_val,
                 mask=mask,
             )
@@ -545,51 +555,65 @@ def _fused_pcp_qkv_select_kernel(
         kv_start_loc // 2 // pcp_world_size * (2 * pcp_world_size - pcp_rank)
         + seq_block_id * kv_select_len
     )
+    n_head_k_head_dim_i64 = tl.cast(n_head * k_head_dim, tl.int64)
+    k_head_dim_i64 = tl.cast(k_head_dim, tl.int64)
+    n_head_v_head_dim_i64 = tl.cast(n_head * v_head_dim, tl.int64)
+    v_head_dim_i64 = tl.cast(v_head_dim, tl.int64)
     for ki in range(tl.cdiv(kv_select_len, SEQ_BLOCK_SIZE)):
         kv_offset = tl.arange(0, SEQ_BLOCK_SIZE) + ki * SEQ_BLOCK_SIZE
         kv_block_mask = kv_offset[:, None] < kv_select_len
-        kv_src_idx = block_src_kv_start_loc + kv_offset[:, None]
-        kv_dst_idx_head = block_dst_kv_head_start_loc + kv_offset[:, None]
-        kv_dst_idx_tail = block_dst_kv_tail_start_loc + kv_offset[:, None]
+        kv_src_idx = (block_src_kv_start_loc + kv_offset[:, None]).to(tl.int64)
+        kv_dst_idx_head = (block_dst_kv_head_start_loc + kv_offset[:, None]).to(
+            tl.int64
+        )
+        kv_dst_idx_tail = (block_dst_kv_tail_start_loc + kv_offset[:, None]).to(
+            tl.int64
+        )
         k_val = tl.load(
-            k_ptr + kv_src_idx * k_stride_B + head_id * k_stride_H + dim_off[None, :],
+            k_ptr
+            + kv_src_idx * k_stride_B_i64
+            + head_id_i64 * k_stride_H_i64
+            + dim_off_i64[None, :],
             mask=k_d_mask & kv_block_mask,
         )
         v_val = tl.load(
-            v_ptr + kv_src_idx * v_stride_B + head_id * v_stride_H + dim_off[None, :],
+            v_ptr
+            + kv_src_idx * v_stride_B_i64
+            + head_id_i64 * v_stride_H_i64
+            + dim_off_i64[None, :],
             mask=v_d_mask & kv_block_mask,
         )
         if seq_block_id < pcp_rank + 1:
             tl.store(
                 out_k_head_ptr
-                + kv_dst_idx_head * n_head * k_head_dim
-                + head_id * k_head_dim
-                + dim_off[None, :],
+                + kv_dst_idx_head * n_head_k_head_dim_i64
+                + head_id_i64 * k_head_dim_i64
+                + dim_off_i64[None, :],
                 k_val,
                 mask=k_d_mask & kv_block_mask,
             )
             tl.store(
                 out_v_head_ptr
-                + kv_dst_idx_head * n_head * v_head_dim
-                + head_id * v_head_dim
-                + dim_off[None, :],
+                + kv_dst_idx_head * n_head_v_head_dim_i64
+                + head_id_i64 * v_head_dim_i64
+                + dim_off_i64[None, :],
                 v_val,
                 mask=v_d_mask & kv_block_mask,
             )
         if seq_block_id < 2 * pcp_world_size - pcp_rank:
             tl.store(
                 out_k_tail_ptr
-                + kv_dst_idx_tail * n_head * k_head_dim
-                + head_id * k_head_dim
-                + dim_off[None, :],
+                + kv_dst_idx_tail * n_head_k_head_dim_i64
+                + head_id_i64 * k_head_dim_i64
+                + dim_off_i64[None, :],
                 k_val,
                 mask=k_d_mask & kv_block_mask,
             )
             tl.store(
                 out_v_tail_ptr
-                + kv_dst_idx_tail * n_head * v_head_dim
-                + head_id * v_head_dim
-                + dim_off[None, :],
+                + kv_dst_idx_tail * n_head_v_head_dim_i64
+                + head_id_i64 * v_head_dim_i64
+                + dim_off_i64[None, :],
                 v_val,
                 mask=v_d_mask & kv_block_mask,
             )

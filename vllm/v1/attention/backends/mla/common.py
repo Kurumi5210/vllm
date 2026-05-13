@@ -538,8 +538,8 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             # which would result in up-projected context being
             #   2*(192*128)*(64*1024) = 3gb
             # (assuming 192 QK head dim, 128 heads, and fp16)
-            # 64 * 1024,
-            524288,
+            64 * 1024,
+            # 524288,
         )
 
         # Enforce that we enough for at least 1 page per request
@@ -1486,6 +1486,19 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             # tail 4   1 1 1 1 1 0 0 0
             #      5   1 1 1 1 1 1 0 0
 
+            # DEBUG: sync to isolate illegal memory access source
+            # import torch.distributed as dist
+            # torch.cuda.synchronize()
+            # rank = dist.get_rank() if dist.is_initialized() else 0
+            # print(f"[DEBUG rank={rank}] Before fused_pcp_qkv_select: "
+            #       f"q.shape={q.shape}, q.stride()={q.stride()}, "
+            #       f"k.shape={k.shape}, k.stride()={k.stride()}, "
+            #       f"v.shape={v.shape}, v.stride()={v.stride()}, "
+            #       f"query_start_loc={prefill.query_start_loc.cpu().tolist()}, "
+            #       f"pcp_rank={self.pcp_rank}, pcp_world_size={self.pcp_world_size}, "
+            #       f"q.is_contiguous()={q.is_contiguous()}, "
+            #       f"k.is_contiguous()={k.is_contiguous()}, "
+            #       f"v.is_contiguous()={v.is_contiguous()}", flush=True)
             q_head, k_head, v_head, q_tail, k_tail, v_tail = fused_pcp_qkv_select(
                 q=q,
                 k=k,
@@ -1494,6 +1507,8 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                 pcp_rank=self.pcp_rank,
                 pcp_world_size=self.pcp_world_size,
             )
+            torch.cuda.synchronize()
+            print(f"[DEBUG rank={rank}] After fused_pcp_qkv_select: OK", flush=True)
 
             pcp_metadata = prefill.pcp_metadata
             assert pcp_metadata is not None
