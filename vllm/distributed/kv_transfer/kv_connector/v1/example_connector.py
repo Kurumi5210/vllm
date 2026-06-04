@@ -118,6 +118,7 @@ class ExampleConnector(KVConnectorBase_V1):
             The number of elements in kv_caches and layer_names should be
             the same.
         """
+        return 
         attn_metadata = forward_context.attn_metadata
 
         def inject_kv_into_layer(
@@ -214,6 +215,7 @@ class ExampleConnector(KVConnectorBase_V1):
         attn_metadata: AttentionMetadata,
         **kwargs: Any,
     ) -> None:
+        return 
         """Start saving the KV cache of the layer from vLLM's paged buffer
         to the connector.
 
@@ -259,6 +261,7 @@ class ExampleConnector(KVConnectorBase_V1):
         request: "Request",
         num_computed_tokens: int,
     ) -> tuple[int | None, bool]:
+        return len(request.prompt_token_ids) - 1, False
         """
         Get number of new tokens that can be loaded from the
         external KV cache beyond the num_computed_tokens.

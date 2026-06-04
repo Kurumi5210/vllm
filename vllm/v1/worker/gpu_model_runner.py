@@ -1351,6 +1351,9 @@ class GPUModelRunner(
         # cu_num_tokens: [2, 5, 3] -> [2, 7, 10]
         # arange: [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
         cu_num_tokens, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
+        # Save original cumulative token counts for logits_indices; PCP
+        # modifies num_scheduled_tokens and recomputes cu_num_tokens below.
+        cu_num_tokens_original = cu_num_tokens
 
         # Get positions.
         positions_np = self.positions.np[:total_num_scheduled_tokens]
@@ -1529,9 +1532,12 @@ class GPUModelRunner(
             # TODO: Support prompt logprobs.
             logits_indices = query_start_loc[1:] - 1
             if self.pcp_world_size > 1:
-                logits_indices = self.pcp_manager.get_logits_indices(
-                    cu_num_tokens, num_reqs
-                )
+                # After get_restore_hidden_states filters padded tokens,
+                # hidden_states has only real tokens in request order.
+                # Use the original (pre-PCP) cumulative counts.
+                logits_indices = torch.from_numpy(
+                    cu_num_tokens_original - 1
+                ).to(self.device, non_blocking=True)
             num_draft_tokens = None
             spec_decode_metadata = None
             num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)

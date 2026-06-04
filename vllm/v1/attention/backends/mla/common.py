@@ -1507,8 +1507,6 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                 pcp_rank=self.pcp_rank,
                 pcp_world_size=self.pcp_world_size,
             )
-            torch.cuda.synchronize()
-            print(f"[DEBUG rank={rank}] After fused_pcp_qkv_select: OK", flush=True)
 
             pcp_metadata = prefill.pcp_metadata
             assert pcp_metadata is not None

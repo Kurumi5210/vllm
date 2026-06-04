@@ -243,13 +243,6 @@ class PCPManager:
             positions,
         )
 
-    def get_logits_indices(self, cu_num_tokens: np.ndarray, num_reqs: int):
-        return (
-            torch.from_numpy(cu_num_tokens) * self.pcp_world_size
-            - self.num_pcp_pads_cpu_tensor[:num_reqs]
-            - 1
-        ).to(self.device, non_blocking=True)
-
     def get_discard_request_mask(
         self,
         num_computed_tokens_cpu: np.ndarray,
@@ -286,11 +279,16 @@ class PCPManager:
             0,
         )
         restore_idx = self.pcp_allgather_restore_idx.gpu[: hidden_states.shape[0]]
-        return torch.index_select(
+        hidden_states = torch.index_select(
             hidden_states,
             0,
             restore_idx,
         )
+        # Filter out padded tokens (duplicate decode copies and prefill padding).
+        # After all_gather + index_select, hidden states are in padded-position
+        # order, which is what pcp_unpad_mask maps onto (True=real, False=pad).
+        mask = self.pcp_unpad_mask_cpu_tensor[: hidden_states.shape[0]]
+        return hidden_states[mask]
 
 
 def check_attention_cp_compatibility(vllm_config: VllmConfig) -> None:
