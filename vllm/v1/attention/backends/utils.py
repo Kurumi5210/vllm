@@ -55,6 +55,22 @@ def is_valid_kv_cache_layout(value: str) -> bool:
 
 
 @dataclass
+class PrefillContextParallelMetadata:
+    """
+    Attention metadata for FlashInfer prefill context parallelism.
+
+    FlashInfer native prefill splits local PCP queries into head/tail chunks
+    and runs each chunk against a different prefix of the restored KV tensor.
+    """
+
+    q_head_indices: torch.Tensor | None = None
+    q_tail_indices: torch.Tensor | None = None
+    kv_for_head_indices: torch.Tensor | None = None
+    kv_for_tail_indices: torch.Tensor | None = None
+    q_full_indices: torch.Tensor | None = None
+
+
+@dataclass
 class CommonAttentionMetadata:
     """
     Per-batch attention metadata, shared across layers and backends.
@@ -1284,6 +1300,56 @@ def pcp_kv_allgather_and_restore(
     key = torch.index_select(key_across_cp, 0, pcp_allgather_restore_idx)
     value = torch.index_select(value_across_cp, 0, pcp_allgather_restore_idx)
     return key, value
+
+
+def get_pcp_selected_indices(
+    start_loc_cpu: torch.Tensor,
+    selected_cu_num_tokens: np.ndarray,
+    need_num_tokens: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, np.ndarray]:
+    """Get selected indices for DualChunkSwap-style PCP load balancing."""
+    start_loc_np = start_loc_cpu.numpy()
+    selected_num_tokens = selected_cu_num_tokens[1:] - selected_cu_num_tokens[:-1]
+    cumsums_offsets = np.repeat(selected_cu_num_tokens[:-1], selected_num_tokens)
+    arange = np.arange(selected_cu_num_tokens[-1], dtype=np.int32) - cumsums_offsets
+    selected_indices = arange + np.repeat(start_loc_np, selected_num_tokens)
+    selected_indices_cpu = torch.from_numpy(selected_indices)
+
+    if need_num_tokens:
+        return selected_indices_cpu, selected_num_tokens
+    return selected_indices_cpu
+
+
+def get_q_indices(
+    q_start_loc_cpu: torch.Tensor,
+    q_indptr_np: np.ndarray,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Get selected query indices for both PCP head and tail chunks."""
+    q_head_indices, q_selected_num_tokens = get_pcp_selected_indices(
+        q_start_loc_cpu, q_indptr_np, need_num_tokens=True
+    )
+    assert isinstance(q_selected_num_tokens, np.ndarray)
+    q_tail_indices = q_head_indices + np.repeat(
+        q_selected_num_tokens, q_selected_num_tokens
+    )
+    return q_head_indices, q_tail_indices
+
+
+def get_kv_indices(
+    kv_start_loc_cpu: torch.Tensor,
+    kv_for_head_indptr_np: np.ndarray,
+    kv_for_tail_indptr_np: np.ndarray,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Get selected KV indices for both PCP head and tail chunks."""
+    kv_for_head_indices = get_pcp_selected_indices(
+        kv_start_loc_cpu, kv_for_head_indptr_np
+    )
+    kv_for_tail_indices = get_pcp_selected_indices(
+        kv_start_loc_cpu, kv_for_tail_indptr_np
+    )
+    assert isinstance(kv_for_head_indices, torch.Tensor)
+    assert isinstance(kv_for_tail_indices, torch.Tensor)
+    return kv_for_head_indices, kv_for_tail_indices
 
 
 def get_pcp_part_indices(
