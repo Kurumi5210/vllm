@@ -4317,10 +4317,32 @@ class GPUModelRunner(
         num_scheduled_tokens = np.array(num_scheduled_tokens_list, dtype=np.int32)
         num_tokens_unpadded = int(num_scheduled_tokens.sum())
 
+        pcp_dummy_tokens_updated = False
+
+        def update_dummy_tokens_for_pcp() -> None:
+            nonlocal num_tokens_unpadded, pcp_dummy_tokens_updated
+            if pcp_dummy_tokens_updated:
+                return
+            num_scheduled_tokens[:num_reqs], _ = (
+                self.pcp_manager.update_tokens_for_pcp(
+                    num_scheduled_tokens[:num_reqs],
+                    self.arange_np,
+                    num_reqs,
+                    self.reorder_batch_threshold,
+                )
+            )
+            num_tokens_unpadded = int(num_scheduled_tokens.sum())
+            pcp_dummy_tokens_updated = True
+
+        if self.pcp_world_size > 1 and (
+            force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL
+        ):
+            update_dummy_tokens_for_pcp()
+
         num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
 
-        _cudagraph_mode, batch_desc, should_ubatch, num_tokens_across_dp, _ = (
-            self._determine_batch_execution_and_padding(
+        def determine_dummy_batch_execution_and_padding():
+            return self._determine_batch_execution_and_padding(
                 num_tokens=num_tokens_unpadded,
                 num_reqs=num_reqs,
                 num_scheduled_tokens_np=num_scheduled_tokens,
@@ -4339,7 +4361,20 @@ class GPUModelRunner(
                 # LoRA state when determining the batch descriptor for capture
                 force_has_lora=activate_lora,
             )
+
+        _cudagraph_mode, batch_desc, should_ubatch, num_tokens_across_dp, _ = (
+            determine_dummy_batch_execution_and_padding()
         )
+
+        if (
+            self.pcp_world_size > 1
+            and not pcp_dummy_tokens_updated
+            and _cudagraph_mode == CUDAGraphMode.FULL
+        ):
+            update_dummy_tokens_for_pcp()
+            _cudagraph_mode, batch_desc, should_ubatch, num_tokens_across_dp, _ = (
+                determine_dummy_batch_execution_and_padding()
+            )
 
         if cudagraph_runtime_mode is None:
             cudagraph_runtime_mode = _cudagraph_mode
