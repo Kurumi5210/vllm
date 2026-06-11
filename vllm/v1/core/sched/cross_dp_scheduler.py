@@ -1,5 +1,6 @@
 from ast import Set
 import itertools
+import os
 import time
 from collections import defaultdict
 from collections.abc import Iterable
@@ -341,7 +342,7 @@ class CrossDPScheduler(Scheduler):
         requests that were never counted (e.g. aborted while still in
         WAITING), so this stays correct on every release path.
         """
-        logger.debug(
+        logger.info(
             "CrossDPScheduler._free_request req_id=%s status=%s "
             "cp_ranks=%s was_in_long_running=%s "
             "request_manager_before=%s "
@@ -470,12 +471,30 @@ class CrossDPScheduler(Scheduler):
         if self.connector is not None:
             self.connector.update_connector_output(kv_connector_output)
 
+        # DyCP debug: configurable delay before marking KV recv as complete.
+        # This keeps requests in WAITING_FOR_REMOTE_KVS longer, making it
+        # easier to reproduce the free_req/add_req count drift bug.
+        # Set VLLM_DYCP_KV_RECV_DELAY_MS=5000 (e.g. 5 seconds) to trigger.
+        _dycp_kv_recv_delay_ms = int(
+            os.environ.get("VLLM_DYCP_KV_RECV_DELAY_MS", "0")
+        )
+        _dycp_kv_recv_delay_sec = _dycp_kv_recv_delay_ms / 1000.0
+
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():
             logger.debug("Finished recving KV transfer for request %s", req_id)
             assert req_id in self.requests
             req = self.requests[req_id]
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                if _dycp_kv_recv_delay_sec > 0:
+                    logger.info(
+                        "DyCP debug: delaying KV recv completion for "
+                        "req_id=%s by %.1fs (VLLM_DYCP_KV_RECV_DELAY_MS=%d)",
+                        req_id,
+                        _dycp_kv_recv_delay_sec,
+                        _dycp_kv_recv_delay_ms,
+                    )
+                    time.sleep(_dycp_kv_recv_delay_sec)
                 self.finished_recving_kv_req_ids.add(req_id)
             else:
                 assert RequestStatus.is_finished(req.status)
@@ -1282,12 +1301,27 @@ class CrossDPScheduler(Scheduler):
                     # into the WAITING_FOR_REMOTE_KV state.
                     skipped_waiting_requests.prepend_request(request)
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+                    logger.info(
+                        "DyCP debug: request %s enters WAITING_FOR_REMOTE_KVS "
+                        "cp_ranks=%s (add_req SKIPPED, free_req on abort "
+                        "will cause count drift!)",
+                        request.request_id,
+                        request.cp_ranks,
+                    )
                     continue
 
                 self.running.append(request)
                 self._mark_long_running(request)
                 self.request_manager.add_req(request)
                 self.waiting.has_slot_for_long_request = self.request_manager.has_slot_for_long_request()
+                logger.info(
+                    "DyCP debug: request %s added to running cp_ranks=%s "
+                    "num_reqs_running=%d request_manager=%s",
+                    request.request_id,
+                    request.cp_ranks,
+                    len(self.running),
+                    self.request_manager,
+                )
 
                 if self.log_stats:
                     request.record_event(
