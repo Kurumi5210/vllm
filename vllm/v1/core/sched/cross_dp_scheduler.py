@@ -1310,10 +1310,10 @@ class CrossDPScheduler(Scheduler):
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
                     logger.info(
                         "DyCP debug: request %s enters WAITING_FOR_REMOTE_KVS "
-                        "cp_ranks=%s (add_req SKIPPED, free_req on abort "
-                        "will cause count drift!)",
+                        "cp_ranks=%s num_req_per_dp=%s (add_req called eagerly)",
                         request.request_id,
                         request.cp_ranks,
+                        self.request_manager.num_req_per_dp,
                     )
                     continue
 
