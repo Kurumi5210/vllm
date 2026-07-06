@@ -2121,7 +2121,7 @@ class MooncakeConnectorWorker:
                 len(cache_list),
             )
 
-            for cache in cache_list:
+            for view_idx, cache in enumerate(cache_list):
                 self._log_debug_cache_registration(layer_name, cache)
                 base_addr = cache.data_ptr()
                 block_len = cache.stride(0) * cache.element_size()
@@ -2138,8 +2138,16 @@ class MooncakeConnectorWorker:
                 storage_addr = storage.data_ptr()
                 if storage_addr not in seen_storage_ptrs:
                     seen_storage_ptrs.add(storage_addr)
-                    kv_data_ptrs.append(storage_addr)
-                    kv_data_lens.append(storage.nbytes())
+                    # Mooncake's ascend transport requires registered
+                    # addresses to be 2MiB-aligned. ``storage.data_ptr()``
+                    # (the raw allocation base) is not guaranteed to be
+                    # aligned, but each KV cache view's ``data_ptr()`` is,
+                    # because the model runner allocates/aligns the views.
+                    # Register from this view's aligned base to the end of
+                    # the backing storage; subsequent views of the same
+                    # storage are skipped via seen_storage_ptrs.
+                    kv_data_ptrs.append(base_addr)
+                    kv_data_lens.append(storage_addr + storage.nbytes() - base_addr)
                 overlay_key = (
                     storage_addr,
                     base_addr,
@@ -2147,11 +2155,23 @@ class MooncakeConnectorWorker:
                     kv_block_len,
                     layer_index,
                 )
+                # When a layer exposes multiple views (e.g. Ascend's compressed
+                # MLA [k_cache, scale_cache] with different dtypes), give each
+                # view a distinct alias name so the alias-group alignment does
+                # not flag them as duplicates. Producer and consumer share the
+                # same cache_list order, so view_idx is deterministic on both
+                # sides. The original layer_name is still used for spec/group
+                # lookups below.
+                region_layer_name = (
+                    f"{layer_name}.view{view_idx}"
+                    if len(cache_list) > 1
+                    else layer_name
+                )
                 logical_groups = list(
                     self._layer_logical_group_indices.get(layer_name, [])
                 )
-                if layer_name not in region_aliases_by_key[overlay_key]:
-                    region_aliases_by_key[overlay_key].append(layer_name)
+                if region_layer_name not in region_aliases_by_key[overlay_key]:
+                    region_aliases_by_key[overlay_key].append(region_layer_name)
                     region_index_aliases_by_key[overlay_key].append(layer_index)
                     region_alias_groups_by_key[overlay_key].append(logical_groups)
                 for group_idx in logical_groups:
@@ -2179,7 +2199,7 @@ class MooncakeConnectorWorker:
                 region_base_addresses.append(base_addr)
                 self.block_len_per_layer.append(block_len)
                 self.kv_block_len_per_layer.append(kv_block_len)
-                self.registered_layer_names.append(layer_name)
+                self.registered_layer_names.append(region_layer_name)
                 self.registered_layer_indices.append(layer_index)
                 self.registered_group_indices.append(
                     self._layer_group_indices[layer_name]
