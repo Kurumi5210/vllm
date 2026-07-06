@@ -1395,10 +1395,12 @@ class MooncakeConnectorWorker:
         seen_base_addresses = []
         self.block_len_per_layer = []
 
-        split_k_and_v = self.transfer_topo.split_k_and_v
         tensor_size_bytes = None
         for layer_name, cache_or_caches in kv_caches.items():
-            cache_list = cache_or_caches if split_k_and_v else [cache_or_caches]
+            if isinstance(cache_or_caches, (list, tuple)):
+                cache_list = list(cache_or_caches)
+            else:
+                cache_list = [cache_or_caches]
             logger.debug(
                 "registering layer %s with %d cache tensor(s)",
                 layer_name,
