@@ -205,6 +205,7 @@ class FlashMLASparseMetadata(AttentionMetadata):
 
     fp8_extra_metadata: FP8SeparatePrefillDecode | FP8KernelMetadata | None = None
     fp8_use_mixed_batch: bool = False
+    topk_indices_are_global_compact_offsets: bool = False
 
 
 def get_prefill_workspace_size(max_model_len: int):
@@ -602,15 +603,16 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         topk_indices: torch.Tensor,
         attn_metadata: FlashMLASparseMetadata,
     ) -> torch.Tensor:
-        # Convert per-request indices to global slots (decode) or workspace
-        # offsets (prefill).
-        topk_indices = triton_convert_req_index_to_global_index(
-            attn_metadata.req_id_per_token,
-            attn_metadata.block_table,
-            topk_indices,
-            BLOCK_SIZE=attn_metadata.block_size,
-            NUM_TOPK_TOKENS=topk_indices.shape[1],
-        )
+        if not attn_metadata.topk_indices_are_global_compact_offsets:
+            # Convert per-request indices to global slots (decode) or workspace
+            # offsets (prefill).
+            topk_indices = triton_convert_req_index_to_global_index(
+                attn_metadata.req_id_per_token,
+                attn_metadata.block_table,
+                topk_indices,
+                BLOCK_SIZE=attn_metadata.block_size,
+                NUM_TOPK_TOKENS=topk_indices.shape[1],
+            )
 
         return self._bf16_flash_mla_kernel(q, kv_c_and_k_pe_cache, topk_indices)
 
@@ -633,22 +635,23 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
             prefill_workspace_starts = fp8_metadata.prefill.workspace_starts
             has_prefill_workspace = True
 
-        # Convert per-request indices to global slots (decode) or workspace
-        # offsets (prefill).
-        # For FP8 cache: prefill uses workspace mapping (upconverted to BF16)
-        # For BF16 cache: always use global cache slots (no workspace)
-        # prefill_workspace_starts has been adjusted in-place per chunk so
-        # prefill indices automatically come out chunk-local
-        topk_indices = triton_convert_req_index_to_global_index(
-            attn_metadata.req_id_per_token,
-            attn_metadata.block_table,
-            topk_indices,
-            BLOCK_SIZE=attn_metadata.block_size,
-            NUM_TOPK_TOKENS=topk_indices.shape[1],
-            HAS_PREFILL_WORKSPACE=has_prefill_workspace,
-            prefill_workspace_request_ids=prefill_request_ids,
-            prefill_workspace_starts=prefill_workspace_starts,
-        )
+        if not attn_metadata.topk_indices_are_global_compact_offsets:
+            # Convert per-request indices to global slots (decode) or workspace
+            # offsets (prefill).
+            # For FP8 cache: prefill uses workspace mapping (upconverted to BF16)
+            # For BF16 cache: always use global cache slots (no workspace)
+            # prefill_workspace_starts has been adjusted in-place per chunk so
+            # prefill indices automatically come out chunk-local
+            topk_indices = triton_convert_req_index_to_global_index(
+                attn_metadata.req_id_per_token,
+                attn_metadata.block_table,
+                topk_indices,
+                BLOCK_SIZE=attn_metadata.block_size,
+                NUM_TOPK_TOKENS=topk_indices.shape[1],
+                HAS_PREFILL_WORKSPACE=has_prefill_workspace,
+                prefill_workspace_request_ids=prefill_request_ids,
+                prefill_workspace_starts=prefill_workspace_starts,
+            )
 
         fp8_metadata = attn_metadata.fp8_extra_metadata
         assert isinstance(fp8_metadata, FlashMLASparseMetadata.FP8SeparatePrefillDecode)
@@ -728,15 +731,16 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         prefill kernel which has head padding overhead when num_heads is small.
         Used when use_mixed_batch is True.
         """
-        # Convert per-request indices to global slots (decode) or workspace
-        # offsets (prefill).
-        topk_indices = triton_convert_req_index_to_global_index(
-            attn_metadata.req_id_per_token,
-            attn_metadata.block_table,
-            topk_indices,
-            BLOCK_SIZE=attn_metadata.block_size,
-            NUM_TOPK_TOKENS=topk_indices.shape[1],
-        )
+        if not attn_metadata.topk_indices_are_global_compact_offsets:
+            # Convert per-request indices to global slots (decode) or workspace
+            # offsets (prefill).
+            topk_indices = triton_convert_req_index_to_global_index(
+                attn_metadata.req_id_per_token,
+                attn_metadata.block_table,
+                topk_indices,
+                BLOCK_SIZE=attn_metadata.block_size,
+                NUM_TOPK_TOKENS=topk_indices.shape[1],
+            )
 
         assert attn_metadata.fp8_extra_metadata is not None
         assert isinstance(
@@ -845,7 +849,10 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
 
-        use_fp8_cache = self.kv_cache_dtype == "fp8_ds_mla"
+        use_fp8_cache = (
+            self.kv_cache_dtype == "fp8_ds_mla"
+            and not attn_metadata.topk_indices_are_global_compact_offsets
+        )
 
         if not use_fp8_cache:
             attn_out = self._forward_bf16_kv(

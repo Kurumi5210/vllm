@@ -271,6 +271,10 @@ class RMSNorm(CustomOp):
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward()."""
+        if 0 in x.shape[:-1]:
+            if residual is None:
+                return x
+            return x, residual
 
         return self.forward_static(
             x,
@@ -287,6 +291,11 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if 0 in x.shape[:-1]:
+            if residual is None:
+                return x
+            return x, residual
+
         if self.variance_size_override is not None:
             return self.forward_native(x, residual)
 
@@ -370,6 +379,11 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if 0 in x.shape[:-1]:
+            if residual is None:
+                return x
+            return x, residual
+
         if self.variance_size_override is not None:
             return self.forward_native(x, residual)
 

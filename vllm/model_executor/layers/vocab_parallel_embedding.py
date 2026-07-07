@@ -461,7 +461,8 @@ class VocabParallelEmbedding(CustomOp):
         param[: loaded_weight.shape[0]].data.copy_(loaded_weight)
         param[loaded_weight.shape[0] :].data.fill_(0)
 
-    def forward_native(self, input_):
+    def forward_parallel(self, input_):
+        """Return this TP rank's local embedding contribution."""
         if self.tp_size > 1:
             # Build the mask.
             masked_input, input_mask = get_masked_input_and_mask(
@@ -479,6 +480,10 @@ class VocabParallelEmbedding(CustomOp):
         # Mask the output embedding.
         if self.tp_size > 1:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
+        return output_parallel
+
+    def forward_native(self, input_):
+        output_parallel = self.forward_parallel(input_)
         # Reduce across all the model parallel GPUs.
         output = tensor_model_parallel_all_reduce(output_parallel)
         return output

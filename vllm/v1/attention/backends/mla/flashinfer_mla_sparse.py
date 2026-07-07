@@ -166,6 +166,7 @@ class FlashInferMLASparseMetadata(AttentionMetadata):
     # Sparse-specific
     block_size: int = 64
     topk_tokens: int = 2048
+    topk_indices_are_global_compact_offsets: bool = False
 
 
 class FlashInferMLASparseMetadataBuilder(
@@ -327,14 +328,18 @@ class FlashInferMLASparseImpl(SparseMLAAttentionImpl[FlashInferMLASparseMetadata
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
 
-        topk_indices_physical, seq_lens = triton_convert_req_index_to_global_index(
-            attn_metadata.req_id_per_token[:num_actual_toks],
-            attn_metadata.block_table,
-            topk_indices,
-            BLOCK_SIZE=attn_metadata.block_size,
-            NUM_TOPK_TOKENS=topk_indices.shape[1],
-            return_valid_counts=True,
-        )
+        if attn_metadata.topk_indices_are_global_compact_offsets:
+            topk_indices_physical = topk_indices
+            seq_lens = (topk_indices >= 0).sum(dim=-1).to(torch.int32)
+        else:
+            topk_indices_physical, seq_lens = triton_convert_req_index_to_global_index(
+                attn_metadata.req_id_per_token[:num_actual_toks],
+                attn_metadata.block_table,
+                topk_indices,
+                BLOCK_SIZE=attn_metadata.block_size,
+                NUM_TOPK_TOKENS=topk_indices.shape[1],
+                return_valid_counts=True,
+            )
 
         if self._workspace_buffer is None:
             self._workspace_buffer = _get_workspace_buffer(q.device)

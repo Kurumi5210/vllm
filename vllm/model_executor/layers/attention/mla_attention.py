@@ -465,12 +465,43 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
         return self._chunked_prefill_workspace_size
 
+    def update_kv_cache(
+        self,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        layer_slot_mapping: torch.Tensor | None = None,
+    ) -> None:
+        forward_context: ForwardContext = get_forward_context()
+        if forward_context.attn_metadata is None:
+            return
+
+        if layer_slot_mapping is None:
+            slot_mapping = forward_context.slot_mapping
+            assert isinstance(slot_mapping, dict), (
+                f"Expected slot_mapping to be a dict, got {type(slot_mapping)}. "
+            )
+            layer_slot_mapping = slot_mapping.get(self.layer_name)
+
+        if layer_slot_mapping is None:
+            return
+
+        self_kv_cache = self.kv_cache[forward_context.virtual_engine]
+        self.impl.do_kv_cache_update(
+            kv_c_normed,
+            k_pe,
+            self_kv_cache,
+            layer_slot_mapping,
+            self.kv_cache_dtype,
+            self._k_scale,
+        )
+
     def forward(
         self,
         q: torch.Tensor,
         kv_c_normed: torch.Tensor,
         k_pe: torch.Tensor,
         output_shape: torch.Size | None = None,
+        use_global_kv: bool = False,
     ) -> torch.Tensor:
         if self.calculate_kv_scales:
             torch.ops.vllm.maybe_calc_kv_scales(q, kv_c_normed, k_pe, self.layer_name)
@@ -486,30 +517,36 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             assert isinstance(slot_mapping, dict), (
                 f"Expected slot_mapping to be a dict, got {type(slot_mapping)}. "
             )
-            self.impl.do_kv_cache_update(
-                kv_c_normed,
-                k_pe,
-                self_kv_cache,
-                slot_mapping.get(self.layer_name),
-                self.kv_cache_dtype,
-                self._k_scale,
-            )
+            if not use_global_kv:
+                self.update_kv_cache(
+                    kv_c_normed,
+                    k_pe,
+                    slot_mapping.get(self.layer_name),
+                )
+            if use_global_kv:
+                attn_kv = torch.cat((kv_c_normed, k_pe.squeeze(1)), dim=-1)
+            else:
+                attn_kv = self_kv_cache
             if self.attn_backend.accept_output_buffer:
                 output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
                 self.forward_impl(
                     q,
                     kv_c_normed,
                     k_pe,
-                    self_kv_cache,
+                    attn_kv,
                     attn_metadata,
                     output=output,
                 )
                 return output
             else:
                 return self.forward_impl(
-                    q, kv_c_normed, k_pe, self_kv_cache, attn_metadata
+                    q, kv_c_normed, k_pe, attn_kv, attn_metadata
                 )
         else:
+            if use_global_kv:
+                raise RuntimeError(
+                    "Sharded-CP global compact KV requires direct MLA calls."
+                )
             kv_cache_dummy_dep = torch.ops.vllm.unified_mla_kv_cache_update(
                 kv_c_normed,
                 k_pe,

@@ -97,6 +97,7 @@ class DeepSeekV32IndexerDecodeMetadata:
     schedule_metadata: torch.Tensor
     use_large_context_topk: bool
     offsets: torch.Tensor | None  # Precomputed offsets for speculative decoding
+    block_size: int = 64
 
 
 @dataclass
@@ -124,6 +125,7 @@ class DeepseekV32IndexerMetadata:
 
     decode: DeepSeekV32IndexerDecodeMetadata | None = None
     prefill: DeepseekV32IndexerPrefillMetadata | None = None
+    k_is_global_compact: bool = False
 
 
 # TODO (zyongye) optimize this, this is now vibe coded
@@ -471,6 +473,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 schedule_metadata=self.scheduler_metadata_buffer,
                 use_large_context_topk=use_large_context_topk,
                 offsets=offsets,
+                block_size=self.kv_cache_spec.block_size,
             )
 
         attn_metadata = DeepseekV32IndexerMetadata(

@@ -3287,6 +3287,25 @@ class GPUModelRunner(
             **model_kwargs,
         )
 
+    def _prepare_hidden_states_for_logits(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        prepare_hidden_states = getattr(
+            self.model, "prepare_hidden_states_for_logits", None
+        )
+        if prepare_hidden_states is None:
+            return hidden_states
+        return prepare_hidden_states(hidden_states)
+
+    def _select_hidden_states_for_logits(
+        self,
+        hidden_states: torch.Tensor,
+        logits_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden_states = self._prepare_hidden_states_for_logits(hidden_states)
+        return hidden_states, hidden_states[logits_indices]
+
     @staticmethod
     def _is_uniform_decode(
         max_num_scheduled_tokens: int,
@@ -3819,14 +3838,18 @@ class GPUModelRunner(
                         kv_connector_output,
                     )
 
-                sample_hidden_states = hidden_states[logits_indices]
+                hidden_states, sample_hidden_states = (
+                    self._select_hidden_states_for_logits(
+                        hidden_states, logits_indices
+                    )
+                )
                 logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
 
-                sample_hidden_states = hidden_states[logits_indices]
                 if not get_pp_group().is_last_rank:
+                    sample_hidden_states = hidden_states[logits_indices]
                     all_gather_tensors = {
                         "residual": not is_residual_scattered_for_sp(
                             self.vllm_config, num_tokens_padded
@@ -3839,6 +3862,11 @@ class GPUModelRunner(
                     )
                     logits = None
                 else:
+                    hidden_states, sample_hidden_states = (
+                        self._select_hidden_states_for_logits(
+                            hidden_states, logits_indices
+                        )
+                    )
                     logits = self.model.compute_logits(sample_hidden_states)
 
                 model_output_broadcast_data: dict[str, Any] = {}
@@ -5075,6 +5103,17 @@ class GPUModelRunner(
                 f"Expected {_cudagraph_mode}, but got {cudagraph_runtime_mode}."
             )
 
+        # Sharded Context Parallel needs request-aligned attention metadata
+        # whenever _dummy_run executes (profile, warmup, cudagraph capture).
+        # If no KV cache exists yet, create a temporary minimal one so
+        # _build_attention_metadata can produce per-layer metadata.
+        _sharded_cp_force = self.parallel_config.enable_sharded_context_parallel
+        if _sharded_cp_force:
+            force_attention = True
+        _init_sharded_cp_kv = _sharded_cp_force and not hasattr(
+            self, "kv_cache_config"
+        )
+
         num_tokens_padded = batch_desc.num_tokens
         num_reqs_padded = (
             batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
@@ -5094,172 +5133,179 @@ class GPUModelRunner(
 
         attn_metadata: PerLayerAttnMetadata | None = None
 
-        slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
-            num_tokens_padded=num_tokens,
-            num_reqs_padded=num_reqs_padded,
-            num_tokens_unpadded=num_tokens_unpadded,
-            ubatch_slices=ubatch_slices_padded,
-        )
+        with self._temporary_sharded_cp_kv_cache(_init_sharded_cp_kv):
+            slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
+                num_tokens_padded=num_tokens,
+                num_reqs_padded=num_reqs_padded,
+                num_tokens_unpadded=num_tokens_unpadded,
+                ubatch_slices=ubatch_slices_padded,
+            )
+            with self.synchronize_input_prep():
+                # If force_attention is True, we always capture attention.
+                # Otherwise, it only happens for cudagraph_runtime_mode=FULL.
+                if force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL:
+                    if profile_seq_lens is not None:
+                        seq_lens = profile_seq_lens  # type: ignore[assignment]
+                    elif create_mixed_batch:
+                        # In the mixed batch mode (used for FI warmup), we use
+                        # shorter sequence lengths to run faster.
+                        # TODO(luka) better system for describing dummy batches
+                        seq_lens = [1] * num_decode_tokens + [num_prefill_tokens + 1]  # type: ignore[assignment]
+                    else:
+                        seq_lens = max_query_len  # type: ignore[assignment]
+                    self.seq_lens.np[:num_reqs] = seq_lens
+                    self.seq_lens.np[num_reqs:] = 0
+                    self.seq_lens.copy_to_gpu()
 
-        # _dummy_run shares pinned CPU buffers (seq_lens, query_start_loc,
-        # etc.) with execute_model.  It must participate in the same event
-        # protocol so that back-to-back dummy/real steps don't overwrite
-        # pinned memory while a prior non_blocking H2D DMA is still reading.
-        with self.synchronize_input_prep():
-            # If force_attention is True, we always capture attention.
-            # Otherwise, it only happens for cudagraph_runtime_mode=FULL.
-            if force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL:
-                if profile_seq_lens is not None:
-                    seq_lens = profile_seq_lens  # type: ignore[assignment]
-                elif create_mixed_batch:
-                    # In the mixed batch mode (used for FI warmup), we use
-                    # shorter sequence lengths to run faster.
-                    # TODO(luka) better system for describing dummy batches
-                    seq_lens = [1] * num_decode_tokens + [num_prefill_tokens + 1]  # type: ignore[assignment]
-                else:
-                    seq_lens = max_query_len  # type: ignore[assignment]
-                self.seq_lens.np[:num_reqs] = seq_lens
-                self.seq_lens.np[num_reqs:] = 0
-                self.seq_lens.copy_to_gpu()
+                    cum_num_tokens, _ = self._get_cumsum_and_arange(
+                        num_scheduled_tokens
+                    )
+                    self.query_start_loc.np[1 : num_reqs + 1] = cum_num_tokens
+                    self.query_start_loc.copy_to_gpu()
 
-                cum_num_tokens, _ = self._get_cumsum_and_arange(num_scheduled_tokens)
-                self.query_start_loc.np[1 : num_reqs + 1] = cum_num_tokens
-                self.query_start_loc.copy_to_gpu()
+                    pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
+                    attn_metadata, _ = self._build_attention_metadata(
+                        num_tokens=num_tokens_unpadded,
+                        num_tokens_padded=num_tokens_padded if pad_attn else None,
+                        num_reqs=num_reqs_padded,
+                        max_query_len=max_query_len,
+                        ubatch_slices=(
+                            ubatch_slices_padded if pad_attn else ubatch_slices
+                        ),
+                        for_cudagraph_capture=is_graph_capturing,
+                        slot_mappings=slot_mappings_by_group,
+                        use_spec_decode=self.speculative_config is not None,
+                    )
 
-                pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
-                attn_metadata, _ = self._build_attention_metadata(
-                    num_tokens=num_tokens_unpadded,
-                    num_tokens_padded=num_tokens_padded if pad_attn else None,
-                    num_reqs=num_reqs_padded,
-                    max_query_len=max_query_len,
-                    ubatch_slices=(ubatch_slices_padded if pad_attn else ubatch_slices),
-                    for_cudagraph_capture=is_graph_capturing,
-                    slot_mappings=slot_mappings_by_group,
-                    use_spec_decode=self.speculative_config is not None,
-                )
-
-        with self.maybe_dummy_run_with_lora(
-            self.lora_config,
-            num_scheduled_tokens,
-            num_sampled_tokens,
-            remove_lora,
-            num_active_loras,
-        ):
-            # Make sure padding doesn't exceed max_num_tokens
-            assert num_tokens_padded <= self.max_num_tokens
-            model_kwargs = self._init_model_kwargs()
-            if self.supports_mm_inputs and not self.model_config.is_encoder_decoder:
-                input_ids, inputs_embeds = self._prepare_mm_inputs(num_tokens_padded)
-
-                model_kwargs = {
-                    **model_kwargs,
-                    **self._dummy_mm_kwargs(num_reqs),
-                }
-            elif self.enable_prompt_embeds:
-                input_ids = None
-                inputs_embeds = self.inputs_embeds.gpu[:num_tokens_padded]
+            with self.maybe_dummy_run_with_lora(
+                self.lora_config,
+                num_scheduled_tokens,
+                num_sampled_tokens,
+                remove_lora,
+                num_active_loras,
+            ):
+                # Make sure padding doesn't exceed max_num_tokens
+                assert num_tokens_padded <= self.max_num_tokens
                 model_kwargs = self._init_model_kwargs()
-            else:
-                input_ids = self.input_ids.gpu[:num_tokens_padded]
-                inputs_embeds = None
-
-            if self.uses_mrope:
-                positions = self.mrope_positions.gpu[:, :num_tokens_padded]
-            elif self.uses_xdrope_dim > 0:
-                positions = self.xdrope_positions.gpu[:, :num_tokens_padded]
-            else:
-                positions = self.positions.gpu[:num_tokens_padded]
-
-            if get_pp_group().is_first_rank:
-                intermediate_tensors = None
-            else:
-                if self.intermediate_tensors is None:
-                    self.intermediate_tensors = (
-                        self.model.make_empty_intermediate_tensors(
-                            batch_size=self.max_num_tokens,
-                            dtype=self.model_config.dtype,
-                            device=self.device,
-                        )
-                    )
-
-                intermediate_tensors = self.sync_and_slice_intermediate_tensors(
-                    num_tokens_padded, None, False
-                )
-
-            if ubatch_slices_padded is not None:
-                # Adjust values to reflect a single ubatch.
-                # TODO(sage,lucas): this is cruft that should be addressed in
-                #  the padding refactor.
-                num_tokens_padded = ubatch_slices_padded[0].num_tokens
-                if num_tokens_across_dp is not None:
-                    num_tokens_across_dp[:] = num_tokens_padded
-
-            with (
-                self.maybe_randomize_inputs(input_ids, inputs_embeds),
-                set_forward_context(
-                    attn_metadata,
-                    self.vllm_config,
-                    num_tokens=num_tokens_padded,
-                    num_tokens_across_dp=num_tokens_across_dp,
-                    cudagraph_runtime_mode=cudagraph_runtime_mode,
-                    batch_descriptor=batch_desc,
-                    ubatch_slices=ubatch_slices_padded,
-                    slot_mapping=slot_mappings,
-                ),
-            ):
-                outputs = self.model(
-                    input_ids=input_ids,
-                    positions=positions,
-                    intermediate_tensors=intermediate_tensors,
-                    inputs_embeds=inputs_embeds,
-                    **model_kwargs,
-                )
-
-            if self.use_aux_hidden_state_outputs:
-                hidden_states, _ = outputs
-            else:
-                hidden_states = outputs
-
-            if self.speculative_config and (
-                self.speculative_config.use_eagle()
-                or self.speculative_config.uses_draft_model()
-                or self.speculative_config.uses_extract_hidden_states()
-            ):
-                assert isinstance(
-                    self.drafter,
-                    EagleProposer | DraftModelProposer | ExtractHiddenStatesProposer,
-                )
-                assert self.speculative_config is not None
-                # Eagle currently only supports PIECEWISE cudagraphs.
-                # Therefore only use cudagraphs if the main model uses PIECEWISE
-                # NOTE(lucas): this is a hack, need to clean up.
-                use_cudagraphs = (
-                    (
-                        is_graph_capturing
-                        and cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
-                    )
-                    or (
-                        not is_graph_capturing
-                        and cudagraph_runtime_mode != CUDAGraphMode.NONE
-                    )
-                ) and not self.speculative_config.enforce_eager
-
-                # Note(gnovack) - We need to disable cudagraphs for one of the two
-                # lora cases when cudagraph_specialize_lora is enabled. This is a
-                # short term mitigation for issue mentioned in
-                # https://github.com/vllm-project/vllm/issues/28334
                 if (
-                    self.compilation_config.cudagraph_specialize_lora
-                    and num_active_loras > 0
+                    self.supports_mm_inputs
+                    and not self.model_config.is_encoder_decoder
                 ):
-                    use_cudagraphs = False
+                    input_ids, inputs_embeds = self._prepare_mm_inputs(
+                        num_tokens_padded
+                    )
 
-                self.drafter.dummy_run(
-                    num_tokens,
-                    use_cudagraphs=use_cudagraphs,
-                    is_graph_capturing=is_graph_capturing,
-                    slot_mappings=slot_mappings,
-                )
+                    model_kwargs = {
+                        **model_kwargs,
+                        **self._dummy_mm_kwargs(num_reqs),
+                    }
+                elif self.enable_prompt_embeds:
+                    input_ids = None
+                    inputs_embeds = self.inputs_embeds.gpu[:num_tokens_padded]
+                    model_kwargs = self._init_model_kwargs()
+                else:
+                    input_ids = self.input_ids.gpu[:num_tokens_padded]
+                    inputs_embeds = None
+
+                if self.uses_mrope:
+                    positions = self.mrope_positions.gpu[:, :num_tokens_padded]
+                elif self.uses_xdrope_dim > 0:
+                    positions = self.xdrope_positions.gpu[:, :num_tokens_padded]
+                else:
+                    positions = self.positions.gpu[:num_tokens_padded]
+
+                if get_pp_group().is_first_rank:
+                    intermediate_tensors = None
+                else:
+                    if self.intermediate_tensors is None:
+                        self.intermediate_tensors = (
+                            self.model.make_empty_intermediate_tensors(
+                                batch_size=self.max_num_tokens,
+                                dtype=self.model_config.dtype,
+                                device=self.device,
+                            )
+                        )
+
+                    intermediate_tensors = self.sync_and_slice_intermediate_tensors(
+                        num_tokens_padded, None, False
+                    )
+
+                if ubatch_slices_padded is not None:
+                    # Adjust values to reflect a single ubatch.
+                    # TODO(sage,lucas): this is cruft that should be addressed in
+                    #  the padding refactor.
+                    num_tokens_padded = ubatch_slices_padded[0].num_tokens
+                    if num_tokens_across_dp is not None:
+                        num_tokens_across_dp[:] = num_tokens_padded
+
+                with (
+                    self.maybe_randomize_inputs(input_ids, inputs_embeds),
+                    set_forward_context(
+                        attn_metadata,
+                        self.vllm_config,
+                        num_tokens=num_tokens_padded,
+                        num_tokens_across_dp=num_tokens_across_dp,
+                        cudagraph_runtime_mode=cudagraph_runtime_mode,
+                        batch_descriptor=batch_desc,
+                        ubatch_slices=ubatch_slices_padded,
+                        slot_mapping=slot_mappings,
+                    ),
+                ):
+                    outputs = self.model(
+                        input_ids=input_ids,
+                        positions=positions,
+                        intermediate_tensors=intermediate_tensors,
+                        inputs_embeds=inputs_embeds,
+                        **model_kwargs,
+                    )
+
+                if self.use_aux_hidden_state_outputs:
+                    hidden_states, _ = outputs
+                else:
+                    hidden_states = outputs
+
+                if self.speculative_config and (
+                    self.speculative_config.use_eagle()
+                    or self.speculative_config.uses_draft_model()
+                    or self.speculative_config.uses_extract_hidden_states()
+                ):
+                    assert isinstance(
+                        self.drafter,
+                        EagleProposer
+                        | DraftModelProposer
+                        | ExtractHiddenStatesProposer,
+                    )
+                    assert self.speculative_config is not None
+                    # Eagle currently only supports PIECEWISE cudagraphs.
+                    # Therefore only use cudagraphs if the main model uses PIECEWISE
+                    # NOTE(lucas): this is a hack, need to clean up.
+                    use_cudagraphs = (
+                        (
+                            is_graph_capturing
+                            and cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
+                        )
+                        or (
+                            not is_graph_capturing
+                            and cudagraph_runtime_mode != CUDAGraphMode.NONE
+                        )
+                    ) and not self.speculative_config.enforce_eager
+
+                    # Note(gnovack) - We need to disable cudagraphs for one of the two
+                    # lora cases when cudagraph_specialize_lora is enabled. This is a
+                    # short term mitigation for issue mentioned in
+                    # https://github.com/vllm-project/vllm/issues/28334
+                    if (
+                        self.compilation_config.cudagraph_specialize_lora
+                        and num_active_loras > 0
+                    ):
+                        use_cudagraphs = False
+
+                    self.drafter.dummy_run(
+                        num_tokens,
+                        use_cudagraphs=use_cudagraphs,
+                        is_graph_capturing=is_graph_capturing,
+                        slot_mappings=slot_mappings,
+                    )
 
         # We register layerwise NVTX hooks here after the first dynamo tracing is
         # done to avoid nvtx operations in hook functions being traced by
@@ -5286,7 +5332,22 @@ class GPUModelRunner(
         logit_indices_device = torch.from_numpy(logit_indices).to(
             self.device, non_blocking=True
         )
-        return hidden_states, hidden_states[logit_indices_device]
+        return self._select_hidden_states_for_logits(
+            hidden_states, logit_indices_device
+        )
+
+    @contextmanager
+    def _temporary_sharded_cp_kv_cache(self, should_init: bool) -> Iterator[None]:
+        if not should_init:
+            yield
+            return
+
+        with set_current_vllm_config(self.vllm_config):
+            self._init_minimal_kv_cache_for_profiling(num_blocks=1)
+        try:
+            yield
+        finally:
+            self._cleanup_profiling_kv_cache()
 
     @torch.inference_mode()
     def _dummy_sampler_run(
@@ -5512,9 +5573,10 @@ class GPUModelRunner(
                         for i, output in enumerate(dummy_encoder_outputs):
                             self.encoder_cache[f"tmp_{i}"] = output
 
-        # Add `is_profile` here to pre-allocate communication buffers
+        # Sharded-CP delegates force_attention + temp KV cache to _dummy_run.
         hidden_states, last_hidden_states = self._dummy_run(
-            self.max_num_tokens, is_profile=True
+            self.max_num_tokens,
+            is_profile=True,
         )
         if get_pp_group().is_last_rank:
             if self.is_pooling_model:
@@ -5528,7 +5590,10 @@ class GPUModelRunner(
         self.encoder_cache.clear()
         gc.collect()
 
-    def _init_minimal_kv_cache_for_profiling(self) -> None:
+    def _init_minimal_kv_cache_for_profiling(
+        self,
+        num_blocks: int | None = None,
+    ) -> None:
         from vllm.v1.core.kv_cache_utils import (
             get_kv_cache_config_from_groups,
             get_kv_cache_groups,
@@ -5536,7 +5601,11 @@ class GPUModelRunner(
 
         kv_cache_spec = self.get_kv_cache_spec()
         kv_cache_groups = get_kv_cache_groups(self.vllm_config, kv_cache_spec)
-        min_blocks = self.compilation_config.max_cudagraph_capture_size or 1
+        min_blocks = (
+            num_blocks
+            if num_blocks is not None
+            else self.compilation_config.max_cudagraph_capture_size or 1
+        )
 
         # Temporarily change num_gpu_blocks_override to allocate a minimal KV cache
         saved_override = self.cache_config.num_gpu_blocks_override
@@ -5549,7 +5618,7 @@ class GPUModelRunner(
         self.initialize_kv_cache(minimal_config)
         self.cache_config.num_gpu_blocks = minimal_config.num_blocks
 
-        logger.debug("Initialized minimal KV cache for CUDA graph profiling")
+        logger.debug("Initialized minimal KV cache for profiling")
 
     @staticmethod
     @contextmanager
@@ -5567,6 +5636,8 @@ class GPUModelRunner(
 
     def _cleanup_profiling_kv_cache(self) -> None:
         torch.accelerator.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         if hasattr(self, "kv_caches") and self.kv_caches:
             for i in range(len(self.kv_caches)):
                 self.kv_caches[i] = None  # type: ignore

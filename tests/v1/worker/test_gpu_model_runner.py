@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
@@ -1304,3 +1306,168 @@ def test_cudagraph_sizes_capped_for_mamba_cache():
             compilation_config.cudagraph_capture_sizes[-1]
             == compilation_config.max_cudagraph_capture_size
         )
+
+
+def test_profile_run_delegates_dummy_setup_for_sharded_cp(monkeypatch):
+    events = []
+    runner = object.__new__(GPUModelRunner)
+    runner.supports_mm_inputs = False
+    runner.parallel_config = SimpleNamespace(enable_sharded_context_parallel=True)
+    runner.max_num_tokens = 8
+    runner.is_pooling_model = False
+    runner.encoder_cache = {"tmp": torch.zeros(1)}
+
+    def _dummy_run(num_tokens, **kwargs):
+        events.append(("dummy_run", num_tokens, kwargs))
+        return torch.zeros(2, 3), torch.ones(2, 3)
+
+    runner._dummy_run = _dummy_run
+    runner._dummy_sampler_run = lambda hidden_states: events.append("sampler")
+    runner._sync_device = lambda: events.append("sync")
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu_model_runner.get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=True),
+    )
+
+    GPUModelRunner.profile_run(runner)
+
+    assert events == [
+        (
+            "dummy_run",
+            8,
+            {
+                "is_profile": True,
+            },
+        ),
+        "sampler",
+        "sync",
+    ]
+    assert runner.encoder_cache == {}
+
+
+def test_profile_run_keeps_default_dummy_path_without_sharded_cp(monkeypatch):
+    events = []
+    runner = object.__new__(GPUModelRunner)
+    runner.supports_mm_inputs = False
+    runner.parallel_config = SimpleNamespace(enable_sharded_context_parallel=False)
+    runner.max_num_tokens = 8
+    runner.is_pooling_model = False
+    runner.encoder_cache = {}
+    runner._dummy_run = lambda num_tokens, **kwargs: events.append(
+        ("dummy_run", num_tokens, kwargs)
+    ) or (torch.zeros(2, 3), torch.ones(2, 3))
+    runner._dummy_sampler_run = lambda hidden_states: events.append("sampler")
+    runner._sync_device = lambda: events.append("sync")
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu_model_runner.get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=True),
+    )
+
+    GPUModelRunner.profile_run(runner)
+
+    assert events == [
+        (
+            "dummy_run",
+            8,
+            {
+                "is_profile": True,
+            },
+        ),
+        "sampler",
+        "sync",
+    ]
+
+
+def test_temporary_sharded_cp_kv_cache_cleans_after_success():
+    events = []
+    runner = object.__new__(GPUModelRunner)
+    runner.vllm_config = SimpleNamespace()
+
+    def _init_profile_kv_cache(*, num_blocks=None):
+        events.append(("init_kv", num_blocks))
+        runner.kv_cache_config = object()
+        runner.attn_groups = [[object()]]
+
+    def _cleanup_profile_kv_cache():
+        events.append("cleanup_kv")
+        runner.attn_groups.clear()
+        del runner.kv_cache_config
+
+    runner._init_minimal_kv_cache_for_profiling = _init_profile_kv_cache
+    runner._cleanup_profiling_kv_cache = _cleanup_profile_kv_cache
+
+    with GPUModelRunner._temporary_sharded_cp_kv_cache(runner, True):
+        events.append("body")
+        assert hasattr(runner, "kv_cache_config")
+        assert runner.attn_groups
+
+    assert events == [("init_kv", 1), "body", "cleanup_kv"]
+    assert runner.attn_groups == []
+    assert not hasattr(runner, "kv_cache_config")
+
+
+def test_temporary_sharded_cp_kv_cache_cleans_after_exception():
+    events = []
+    runner = object.__new__(GPUModelRunner)
+    runner.vllm_config = SimpleNamespace()
+
+    def _init_profile_kv_cache(*, num_blocks=None):
+        events.append(("init_kv", num_blocks))
+        runner.kv_cache_config = object()
+        runner.attn_groups = [[object()]]
+
+    def _cleanup_profile_kv_cache():
+        events.append("cleanup_kv")
+        runner.attn_groups.clear()
+        del runner.kv_cache_config
+
+    runner._init_minimal_kv_cache_for_profiling = _init_profile_kv_cache
+    runner._cleanup_profiling_kv_cache = _cleanup_profile_kv_cache
+
+    with pytest.raises(RuntimeError, match="dummy failure"):
+        with GPUModelRunner._temporary_sharded_cp_kv_cache(runner, True):
+            events.append("body")
+            raise RuntimeError("dummy failure")
+
+    assert events == [("init_kv", 1), "body", "cleanup_kv"]
+    assert runner.attn_groups == []
+    assert not hasattr(runner, "kv_cache_config")
+
+
+def test_select_hidden_states_for_logits_prepares_before_indexing():
+    runner = object.__new__(GPUModelRunner)
+    local_hidden = torch.arange(4, dtype=torch.float32).view(2, 2)
+    global_hidden = torch.arange(8, dtype=torch.float32).view(4, 2)
+    logits_indices = torch.tensor([1, 3], dtype=torch.int64)
+    calls = []
+
+    class FakeModel:
+        def prepare_hidden_states_for_logits(self, hidden_states):
+            calls.append(hidden_states)
+            return global_hidden
+
+    runner.model = FakeModel()
+
+    hidden_states, sample_hidden_states = runner._select_hidden_states_for_logits(
+        local_hidden,
+        logits_indices,
+    )
+
+    assert calls == [local_hidden]
+    assert hidden_states is global_hidden
+    assert torch.equal(sample_hidden_states, global_hidden[logits_indices])
+
+
+def test_select_hidden_states_for_logits_keeps_default_indexing():
+    runner = object.__new__(GPUModelRunner)
+    runner.model = SimpleNamespace()
+    hidden = torch.arange(8, dtype=torch.float32).view(4, 2)
+    logits_indices = torch.tensor([1, 3], dtype=torch.int64)
+
+    hidden_states, sample_hidden_states = runner._select_hidden_states_for_logits(
+        hidden,
+        logits_indices,
+    )
+
+    assert hidden_states is hidden
+    assert torch.equal(sample_hidden_states, hidden[logits_indices])

@@ -24,6 +24,7 @@ from vllm.logger import enable_trace_function_call, init_logger
 from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.utils import random_uuid
 from vllm.utils.hashing import safe_hash
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from .attention import AttentionConfig
 from .cache import CacheConfig
@@ -241,6 +242,15 @@ OPTIMIZATION_LEVEL_TO_CONFIG = {
     OptimizationLevel.O2: OPTIMIZATION_LEVEL_02,
     OptimizationLevel.O3: OPTIMIZATION_LEVEL_03,
 }
+
+SHARDED_CP_SPARSE_MLA_BACKENDS = frozenset(
+    {
+        AttentionBackendEnum.FLASHMLA_SPARSE,
+        AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
+        AttentionBackendEnum.ROCM_AITER_MLA_SPARSE,
+        AttentionBackendEnum.XPU_MLA_SPARSE,
+    }
+)
 
 
 @config(config=ConfigDict(arbitrary_types_allowed=True))
@@ -655,6 +665,53 @@ class VllmConfig:
         # This is the same for all backends
         self.kv_transfer_config.kv_role = "kv_both"
 
+    def _validate_sharded_context_parallel_config(self) -> None:
+        """Validate cross-config requirements for Sharded-CP.
+
+        ParallelConfig validates topology-only constraints. Checks that depend
+        on the model, attention backend, speculative decoding, or compilation
+        defaults live here.
+        """
+        if not self.parallel_config.enable_sharded_context_parallel:
+            return
+
+        if self.model_config is None:
+            raise ValueError(
+                "enable_sharded_context_parallel requires a model_config."
+            )
+        if not getattr(self.model_config, "use_mla", False):
+            raise ValueError(
+                "enable_sharded_context_parallel requires an MLA model."
+            )
+        hf_config = getattr(self.model_config, "hf_config", None)
+        if hf_config is None or not hasattr(hf_config, "index_topk"):
+            raise ValueError(
+                "enable_sharded_context_parallel requires a DSA sparse MLA "
+                "model config with index_topk."
+            )
+
+        backend = self.attention_config.backend
+        if backend is not None and backend not in SHARDED_CP_SPARSE_MLA_BACKENDS:
+            supported = ", ".join(
+                sorted(backend.name for backend in SHARDED_CP_SPARSE_MLA_BACKENDS)
+            )
+            raise ValueError(
+                "enable_sharded_context_parallel requires a sparse MLA "
+                "attention backend when one is explicitly set, got "
+                f"{backend.name}. Supported backends: {supported}."
+            )
+
+        if self.speculative_config is not None:
+            raise ValueError(
+                "enable_sharded_context_parallel does not support speculative "
+                "decoding yet."
+            )
+        if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
+            raise ValueError(
+                "enable_sharded_context_parallel does not support full CUDA "
+                "graphs yet. Set cudagraph_mode to NONE or PIECEWISE."
+            )
+
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
 
@@ -993,6 +1050,8 @@ class VllmConfig:
             self._set_cudagraph_sizes()
         else:
             self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+
+        self._validate_sharded_context_parallel_config()
 
         if self.cache_config.kv_sharing_fast_prefill:
             if (
