@@ -123,6 +123,14 @@ class ParallelConfig:
     """Number of tensor parallel groups."""
     prefill_context_parallel_size: int = Field(default=1, ge=1)
     """Number of prefill context parallel groups."""
+    enable_sharded_context_parallel: bool = False
+    """Enable Sharded Context Parallelism for DSA sparse MLA prefill.
+
+    This feature reuses the tensor-parallel process group as a CP group in the
+    first implementation, but keeps a CP-local hidden-state layout across
+    Transformer layers. It is mutually exclusive with existing PCP/DCP and
+    ubatching paths until those paths have explicit Sharded-CP support.
+    """
     data_parallel_size: int = Field(default=1, ge=1)
     """Number of data parallel groups. MoE layers will be sharded according to
     the product of the tensor parallel size and data parallel size."""
@@ -510,6 +518,33 @@ class ParallelConfig:
             raise ValueError(
                 "dcp_comm_backend='a2a' requires decode_context_parallel_size > 1."
             )
+
+        if self.enable_sharded_context_parallel:
+            if self.tensor_parallel_size <= 1:
+                raise ValueError(
+                    "enable_sharded_context_parallel requires "
+                    "tensor_parallel_size > 1."
+                )
+            if self.pipeline_parallel_size != 1:
+                raise ValueError(
+                    "enable_sharded_context_parallel requires "
+                    "pipeline_parallel_size == 1."
+                )
+            if self.prefill_context_parallel_size != 1:
+                raise ValueError(
+                    "enable_sharded_context_parallel requires "
+                    "prefill_context_parallel_size == 1."
+                )
+            if self.decode_context_parallel_size != 1:
+                raise ValueError(
+                    "enable_sharded_context_parallel requires "
+                    "decode_context_parallel_size == 1."
+                )
+            if self.use_ubatching:
+                raise ValueError(
+                    "enable_sharded_context_parallel does not support "
+                    "DBO/ubatching yet."
+                )
 
         return self
 

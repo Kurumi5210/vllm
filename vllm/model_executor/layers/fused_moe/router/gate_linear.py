@@ -118,6 +118,17 @@ class GateLinear(ReplicatedLinear):
     def forward(
         self, x: torch.Tensor
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        import vllm._custom_ops as ops
+
+        if self._has_empty_batch(x):
+            bias = self.bias if not self.skip_bias_add else None
+            output = self._empty_output(x, self.output_size)
+            if bias is not None:
+                output = output + bias
+            if self.out_dtype is not None and output.dtype != self.out_dtype:
+                output = output.to(self.out_dtype)
+            output_bias = self.bias if self.skip_bias_add else None
+            return output, output_bias
         # Tier 1: DSV3 specialized kernel
         if self.allow_dsv3_router_gemm and x.shape[0] <= self._dsv3_max_batch:
             output = ops.dsv3_router_gemm(

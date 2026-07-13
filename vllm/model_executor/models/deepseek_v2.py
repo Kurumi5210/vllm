@@ -26,6 +26,8 @@
 
 import typing
 from collections.abc import Callable, Iterable
+from contextlib import nullcontext
+from dataclasses import replace
 from itertools import islice
 
 import torch
@@ -43,6 +45,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
@@ -66,14 +69,8 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
 )
-from vllm.model_executor.layers.quantization.utils.quant_utils import (
-    GroupShape,
-    scaled_dequantize,
-)
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.layers.sparse_attn_indexer import (
-    SparseAttnIndexer,
-)
+from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -83,12 +80,31 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     extract_layer_index,
     sequence_parallel_chunk,
 )
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.v1.attention.backends.mla.sharded_cp_metadata import (
+    get_sharded_cp_token_range_from_forward_context,
+    sharded_cp_forward_context,
+)
+from vllm.model_executor.layers.fused_moe.sharded_cp_moe import (
+    all_gather_sharded_cp_moe_inputs,
+    reduce_scatter_sharded_cp_moe_output,
+)
+from vllm.model_executor.layers.sharded_cp_shard_linear import (
+    ShardedCPShardLinearLayer,
+    ShardedCPShardLinearPrefetch,
+)
+from vllm.distributed.sharded_cp_utils import (
+    ShardedCPTokenRange,
+    all_gather_token_rows,
+    get_sharded_cp_group,
+    get_sharded_cp_token_range,
+    reduce_scatter_token_rows,
+    slice_for_token_reduce_scatter,
+)
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.mla.indexer import (
@@ -105,7 +121,6 @@ from .interfaces import (
 )
 from .utils import (
     PPMissingLayer,
-    get_pp_missing_layer_names,
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -113,6 +128,14 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+
+def _layer_id_from_prefix(prefix: str) -> int:
+    parts = prefix.split(".")
+    for idx, part in enumerate(parts[:-1]):
+        if part == "layers":
+            return int(parts[idx + 1])
+    raise ValueError(f"Cannot infer layer id from prefix: {prefix!r}.")
 
 
 class DeepseekAttention(nn.Module):
@@ -264,6 +287,9 @@ class DeepseekV2MoE(nn.Module):
         self.n_shared_experts: int = config.n_shared_experts
 
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
+        self.use_sharded_cp_token_parallel = (
+            parallel_config.enable_sharded_context_parallel
+        )
 
         if config.hidden_act != "silu":
             raise ValueError(
@@ -358,9 +384,104 @@ class DeepseekV2MoE(nn.Module):
                 self.gate.e_score_correction_bias.data.to(self.gate.out_dtype)
             )
 
+    def _get_sharded_cp_token_range(self) -> ShardedCPTokenRange:
+        if not is_forward_context_available():
+            raise RuntimeError(
+                "Sharded-CP MoE requires a forward context with the current "
+                "token range."
+            )
+        token_range = get_forward_context().additional_kwargs.get(
+            "sharded_cp_token_range"
+        )
+        if not isinstance(token_range, ShardedCPTokenRange):
+            raise RuntimeError(
+                "Sharded-CP MoE requires sharded_cp_token_range in the "
+                "forward context."
+            )
+        return token_range
+
+    def _maybe_get_sharded_cp_token_range(self) -> ShardedCPTokenRange | None:
+        if not is_forward_context_available():
+            return None
+        token_range = get_forward_context().additional_kwargs.get(
+            "sharded_cp_token_range"
+        )
+        if token_range is None:
+            return None
+        if not isinstance(token_range, ShardedCPTokenRange):
+            raise RuntimeError(
+                "Sharded-CP MoE requires sharded_cp_token_range in the "
+                "forward context."
+            )
+        return token_range
+
+    def _forward_sharded_cp(
+        self,
+        hidden_states: torch.Tensor,
+        token_range: ShardedCPTokenRange,
+    ) -> torch.Tensor:
+        if self.is_sequence_parallel:
+            raise RuntimeError(
+                "Sharded-CP MoE does not support sequence_parallel_moe yet."
+            )
+        if hidden_states.shape[0] != token_range.num_tokens:
+            raise ValueError(
+                "Sharded-CP MoE hidden rows must match the local token range: "
+                f"got {hidden_states.shape[0]}, expected "
+                f"{token_range.num_tokens}."
+            )
+
+        if self.experts.is_internal_router:
+            router_logits = hidden_states
+        elif token_range.num_tokens == 0:
+            router_dtype = getattr(self.gate, "out_dtype", None) or hidden_states.dtype
+            router_logits = torch.empty(
+                (0, self.n_routed_experts),
+                device=hidden_states.device,
+                dtype=router_dtype,
+            )
+        else:
+            # router_logits: (num_tokens, n_experts)
+            router_logits, _ = self.gate(hidden_states)
+
+        cp_group = get_sharded_cp_group()
+        moe_inputs = all_gather_sharded_cp_moe_inputs(
+            hidden_states,
+            router_logits,
+            token_range,
+            group=cp_group.device_group,
+        )
+        if self.experts.is_internal_router:
+            final_hidden_states = self.experts(
+                hidden_states=moe_inputs.hidden_states,
+                router_logits=moe_inputs.router_logits,
+            )
+        else:
+            final_hidden_states = self.experts(
+                hidden_states=moe_inputs.hidden_states,
+                router_logits=moe_inputs.router_logits,
+            )
+
+        return reduce_scatter_sharded_cp_moe_output(
+            final_hidden_states,
+            token_range,
+            group=cp_group.device_group,
+        )
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+
+        if self.use_sharded_cp_token_parallel:
+            token_range = self._maybe_get_sharded_cp_token_range()
+        else:
+            token_range = None
+        if token_range is not None:
+            final_hidden_states = self._forward_sharded_cp(
+                hidden_states,
+                token_range,
+            )
+            return final_hidden_states.view(num_tokens, hidden_dim)
 
         # Chunk the hidden states so they aren't replicated across TP ranks.
         # This avoids duplicate computation in self.experts.
@@ -370,10 +491,12 @@ class DeepseekV2MoE(nn.Module):
             hidden_states = sequence_parallel_chunk(hidden_states)
 
         if self.experts.is_internal_router:
+            # In this case, the gate/router runs inside the FusedMoE class
             final_hidden_states = self.experts(
                 hidden_states=hidden_states, router_logits=hidden_states
             )
         else:
+            # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
             final_hidden_states = self.experts(
                 hidden_states=hidden_states, router_logits=router_logits
@@ -576,7 +699,7 @@ class DeepseekV32IndexerCache(torch.nn.Module, AttentionLayerBase):
         self, head_dim: int, dtype: torch.dtype, prefix: str, cache_config: CacheConfig
     ):
         super().__init__()
-        self.kv_cache = torch.tensor([])
+        self.kv_cache = [torch.tensor([])]
         self.head_dim = head_dim
         self.prefix = prefix
         self.cache_config = cache_config
@@ -611,12 +734,10 @@ class Indexer(nn.Module):
         cache_config: CacheConfig | None,
         topk_indices_buffer: torch.Tensor | None,
         prefix: str = "",
-        is_inplace_rope: bool = False,
     ):
         super().__init__()
         self.vllm_config = vllm_config
         self.config = config
-        self.quant_config = quant_config
         # self.indexer_cfg = config.attn_module_list_cfg[0]["attn_index"]
         self.topk_tokens = config.index_topk
         self.n_head = config.index_n_heads  # 64
@@ -631,17 +752,21 @@ class Indexer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.wq_b",
         )
-        # Fused wk + weights_proj: single GEMM producing [head_dim + n_head].
-        # FP8 wk weights are upcasted to BF16 during loading to maintain fusion.
-        self.wk_weights_proj = MergedColumnParallelLinear(
+        self.wk = ReplicatedLinear(
             hidden_size,
-            [self.head_dim, self.n_head],
+            self.head_dim,
             bias=False,
-            quant_config=None,
-            disable_tp=True,
-            prefix=f"{prefix}.wk_weights_proj",
+            quant_config=quant_config,
+            prefix=f"{prefix}.wk",
         )
         self.k_norm = LayerNorm(self.head_dim, eps=1e-6)
+        self.weights_proj = ReplicatedLinear(
+            hidden_size,
+            self.n_head,
+            bias=False,
+            quant_config=None,
+            prefix=f"{prefix}.weights_proj",
+        )
         self.softmax_scale = self.head_dim**-0.5
 
         self.scale_fmt = "ue8m0"
@@ -673,58 +798,31 @@ class Indexer(nn.Module):
             self.topk_indices_buffer,
         )
 
-        self.is_inplace_rope = is_inplace_rope
-
-    def forward(
+    def project(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        q_fp8, q_scale = self.project_q(qr, positions, rotary_emb)
+        k = self.project_k(hidden_states, positions, rotary_emb)
+        weights = self.project_weights(hidden_states, q_scale)
+        return q_fp8, k, weights
+
+    def project_q(
+        self,
+        qr: torch.Tensor,
+        positions: torch.Tensor,
+        rotary_emb,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
-
-        if current_platform.is_rocm() and self.is_inplace_rope:
-            # This path should works on all platform, will remove extra
-            # branches in the future
-            # This fast path relies on rotary_emb mutating q and k inplace.
-            # On ROCm, this is only valid for kernels used as custom ops.
-            # In pytorch-native rope for inductor fusion, rotated q/k tensors
-            # are not mutated inplace but returned as new tensors.
-            # Fused wk + weights_proj: one GEMM, then split
-            kw, _ = self.wk_weights_proj(hidden_states)
-            k = kw[:, : self.head_dim]
-            weights = kw[:, self.head_dim :]
-
-            k = self.k_norm(k)
-
-            rotary_emb(
-                positions, q[..., : self.rope_dim], k[..., : self.rope_dim].unsqueeze(1)
-            )
-        else:
-            q_pe, q_nope = torch.split(
-                q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
-            )
-            # Fused wk + weights_proj: one GEMM, then split
-            kw, _ = self.wk_weights_proj(hidden_states)
-            k = kw[:, : self.head_dim]
-            weights = kw[:, self.head_dim :]
-
-            k = self.k_norm(k)
-            k_pe, k_nope = torch.split(
-                k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
-            )
-
-            q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
-            # Note: RoPE (NeoX) can introduce extra leading dimensions during
-            # compilation so we need to reshape back to token-flattened shapes
-            q_pe = q_pe.reshape(-1, self.n_head, self.rope_dim)
-            k_pe = k_pe.reshape(-1, 1, self.rope_dim)
-
-            # `rotary_emb` is shape-preserving; `q_pe` is already
-            # [num_tokens, n_head, rope_dim].
-            q = torch.cat([q_pe, q_nope], dim=-1)
-            # `k_pe` is [num_tokens, 1, rope_dim] (MQA).
-            k = torch.cat([k_pe.squeeze(-2), k_nope], dim=-1)
-
-        # we only quant q here since k quant is fused with cache insertion
+        q_pe, q_nope = torch.split(
+            q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
+        )
+        empty_k = q_pe.new_zeros((q_pe.shape[0], 1, self.rope_dim))
+        q_pe, _ = rotary_emb(positions, q_pe, empty_k)
+        # Note: RoPE (NeoX) can introduce extra leading dimensions during
+        # compilation so we reshape back to token-flattened shapes.
+        q_pe = q_pe.reshape(-1, self.n_head, self.rope_dim)
+        q = torch.cat([q_pe, q_nope], dim=-1)
         q = q.view(-1, self.head_dim)
         q_fp8, q_scale = per_token_group_quant_fp8(
             q,
@@ -734,60 +832,108 @@ class Indexer(nn.Module):
         )
         q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
         q_scale = q_scale.view(-1, self.n_head, 1)
+        return q_fp8, q_scale
 
+    def project_k(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        rotary_emb,
+        q_pe_for_rope: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        k, _ = self.wk(hidden_states)
+        k = self.k_norm(k)
+        k_pe, k_nope = torch.split(
+            k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
+        )
+        if q_pe_for_rope is None:
+            q_pe_for_rope = k_pe.new_zeros((k_pe.shape[0], 1, self.rope_dim))
+        _, k_pe = rotary_emb(positions, q_pe_for_rope, k_pe.unsqueeze(1))
+        k_pe = k_pe.reshape(-1, 1, self.rope_dim)
+        # `k_pe` is [num_tokens, 1, rope_dim] (MQA).
+        return torch.cat([k_pe.squeeze(-2), k_nope], dim=-1)
+
+    def project_weights(
+        self,
+        hidden_states: torch.Tensor,
+        q_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        weights, _ = self.weights_proj(hidden_states)
         weights = (
             weights.unsqueeze(-1) * q_scale * self.softmax_scale * self.n_head**-0.5
         )
-        weights = weights.squeeze(-1)
+        return weights.squeeze(-1)
 
+    def forward_global_compact(
+        self,
+        hidden_states: torch.Tensor,
+        q_fp8: torch.Tensor,
+        indexer_k_global: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.indexer_op.forward_global_compact(
+            hidden_states,
+            q_fp8,
+            indexer_k_global,
+            weights,
+        )
+
+    def update_local_k_cache(
+        self,
+        indexer_k: torch.Tensor,
+        layer_slot_mapping: torch.Tensor | None = None,
+    ) -> None:
+        forward_context = get_forward_context()
+        attn_metadata = forward_context.attn_metadata
+        if attn_metadata is None:
+            return
+        if layer_slot_mapping is None:
+            slot_mapping = forward_context.slot_mapping
+            assert isinstance(slot_mapping, dict), (
+                f"Expected slot_mapping to be a dict, got {type(slot_mapping)}. "
+            )
+            layer_slot_mapping = slot_mapping.get(self.k_cache.prefix)
+        if layer_slot_mapping is None or layer_slot_mapping.numel() == 0:
+            return
+        if layer_slot_mapping.shape[0] > indexer_k.shape[0]:
+            layer_slot_mapping = layer_slot_mapping[: indexer_k.shape[0]]
+        ops.indexer_k_quant_and_cache(
+            indexer_k[: layer_slot_mapping.shape[0]],
+            self.k_cache.kv_cache[0],
+            layer_slot_mapping,
+            self.quant_block_size,
+            self.scale_fmt,
+        )
+
+    def forward_local_paged(
+        self,
+        hidden_states: torch.Tensor,
+        q_fp8: torch.Tensor,
+        indexer_k: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor:
+        attn_metadata = get_forward_context().attn_metadata
+        if not isinstance(attn_metadata, dict):
+            return self.indexer_op(hidden_states, q_fp8, indexer_k, weights)
+
+        metadata = attn_metadata.get(self.k_cache.prefix)
+        if not getattr(metadata, "k_is_global_compact", False):
+            return self.indexer_op(hidden_states, q_fp8, indexer_k, weights)
+
+        attn_metadata[self.k_cache.prefix] = replace(
+            metadata,
+            k_is_global_compact=False,
+        )
+        try:
+            return self.indexer_op(hidden_states, q_fp8, indexer_k, weights)
+        finally:
+            attn_metadata[self.k_cache.prefix] = metadata
+
+    def forward(
+        self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
+    ) -> torch.Tensor:
+        q_fp8, k, weights = self.project(hidden_states, qr, positions, rotary_emb)
         return self.indexer_op(hidden_states, q_fp8, k, weights)
-
-
-def _try_load_fp8_indexer_wk(
-    name, tensor, buf, params_dict, loaded_params, pp_missing_layer_names
-):
-    """
-    We fuse the WK and weights_proj projections, but in some checkpoints WK is stored
-    in FP8 with a separate weight_scale_inv, while weights_proj is stored in BF16.
-    Upcasting to BF16 during loading enables the fusion. This function loads the FP8 WK
-    weights and scale, and when both are available, dequantizes to BF16 and stores into
-    the fused wk_weights_proj.weight parameter.
-    """
-    if "indexer.wk." not in name or "wk_weights" in name:
-        return False  # Weight is not an isolated WK weight for the indexer, ignore.
-    is_weight = name.endswith(".weight") and tensor.dtype == torch.float8_e4m3fn
-    is_scale = "weight_scale_inv" in name
-    if not is_weight and not is_scale:
-        return False  # WK is not in FP8 format, ignore.
-    # Buffer this tensor (weight or scale) until both have arrived.
-    layer_prefix = name.rsplit(".wk.", 1)[0]  # e.g. "model.layers.0.self_attn.indexer"
-    fused_name = f"{layer_prefix}.wk_weights_proj.weight"
-    if any(
-        name.startswith(missing_layer_name)
-        for missing_layer_name in pp_missing_layer_names
-    ):
-        return True
-    entry = buf.setdefault(layer_prefix, {})
-    entry["weight" if is_weight else "scale"] = tensor
-    if "weight" not in entry or "scale" not in entry:
-        return True  # still waiting for the other param
-
-    # We have both weight and scale: dequantize FP8 to BF16.
-    weight_fp8, scale_inv = entry["weight"], entry["scale"]
-    del buf[layer_prefix]
-    block_size = weight_fp8.shape[1] // scale_inv.shape[1]
-    weight_bf16 = scaled_dequantize(
-        weight_fp8,
-        scale_inv,
-        group_shape=GroupShape(block_size, block_size),
-        out_dtype=torch.bfloat16,
-    )
-
-    # Load the dequantized weight into shard 0 of the fused buffer.
-    param = params_dict[fused_name]
-    param.weight_loader(param, weight_bf16, 0)
-    loaded_params.add(fused_name)
-    return True
 
 
 def _min_latency_fused_qkv_a_proj_impl(
@@ -916,6 +1062,14 @@ class DeepseekV2MLAAttention(nn.Module):
         tp_size = get_tensor_model_parallel_world_size()
         assert num_heads % tp_size == 0
         self.num_local_heads = num_heads // tp_size
+        self.is_v32 = hasattr(config, "index_topk")
+        self.enable_sharded_context_parallel = (
+            vllm_config.parallel_config.enable_sharded_context_parallel
+        )
+        self.use_sharded_cp_full_attention = (
+            self.enable_sharded_context_parallel and self.is_v32
+        )
+        self.sharded_cp_shard_linear: ShardedCPShardLinearLayer | None = None
 
         self.scaling = self.qk_head_dim**-0.5
         self.max_position_embeddings = max_position_embeddings
@@ -947,6 +1101,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 self.num_heads * self.qk_head_dim,
                 bias=False,
                 quant_config=quant_config,
+                disable_tp=self.use_sharded_cp_full_attention,
                 prefix=f"{prefix}.q_b_proj",
             )
         else:
@@ -955,6 +1110,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 self.num_heads * self.qk_head_dim,
                 bias=False,
                 quant_config=quant_config,
+                disable_tp=self.use_sharded_cp_full_attention,
                 prefix=f"{prefix}.q_proj",
             )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
@@ -963,6 +1119,7 @@ class DeepseekV2MLAAttention(nn.Module):
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
             quant_config=quant_config,
+            disable_tp=self.use_sharded_cp_full_attention,
             prefix=f"{prefix}.kv_b_proj",
         )
         self.o_proj = RowParallelLinear(
@@ -970,8 +1127,21 @@ class DeepseekV2MLAAttention(nn.Module):
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
+            input_is_parallel=True,
+            reduce_results=not self.use_sharded_cp_full_attention,
+            disable_tp=self.use_sharded_cp_full_attention,
             prefix=f"{prefix}.o_proj",
         )
+        if self.use_sharded_cp_full_attention:
+            q_up_proj = self.q_b_proj if self.q_lora_rank is not None else self.q_proj
+            self.sharded_cp_shard_linear = ShardedCPShardLinearLayer(
+                _layer_id_from_prefix(prefix),
+                (
+                    ("q_up_proj", q_up_proj),
+                    ("kv_b_proj", self.kv_b_proj),
+                    ("o_proj", self.o_proj),
+                ),
+            )
 
         if config.rope_parameters["rope_type"] != "default":
             config.rope_parameters["rope_type"] = (
@@ -995,8 +1165,6 @@ class DeepseekV2MLAAttention(nn.Module):
             scaling_factor = config.rope_parameters["factor"]
             mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
             self.scaling = self.scaling * mscale * mscale
-
-        self.is_v32 = hasattr(config, "index_topk")
 
         # IndexCache config
         # Refer: https://arxiv.org/abs/2603.12201 for more details.
@@ -1042,7 +1210,6 @@ class DeepseekV2MLAAttention(nn.Module):
                 cache_config,
                 topk_indices_buffer,
                 f"{prefix}.indexer",
-                is_inplace_rope=self.indexer_rope_emb.enabled(),
             )
         else:
             self.indexer_rope_emb = None
@@ -1066,11 +1233,14 @@ class DeepseekV2MLAAttention(nn.Module):
             indexer_rotary_emb=self.indexer_rope_emb,
             is_sparse=self.is_v32,
             topk_indices_buffer=topk_indices_buffer,
+            enable_sharded_context_parallel=self.use_sharded_cp_full_attention,
         )
 
         self.mla_attn = MultiHeadLatentAttentionWrapper(
             self.hidden_size,
-            self.num_local_heads,
+            self.num_heads
+            if self.use_sharded_cp_full_attention
+            else self.num_local_heads,
             self.scaling,
             self.qk_nope_head_dim,
             self.qk_rope_head_dim,
@@ -1081,7 +1251,6 @@ class DeepseekV2MLAAttention(nn.Module):
             cache_config,
             quant_config,
             prefix,
-            skip_topk=_skip_topk,
         )
 
     def forward(
@@ -1169,6 +1338,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                is_sequence_parallel=parallel_config.enable_sharded_context_parallel,
                 prefix=f"{prefix}.mlp",
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1176,6 +1346,41 @@ class DeepseekV2DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
+        self.enable_sharded_context_parallel = (
+            parallel_config.enable_sharded_context_parallel
+        )
+
+    def prefetch_sharded_cp_attention_weights(
+        self,
+        group=None,
+    ) -> ShardedCPShardLinearPrefetch | None:
+        if not self.enable_sharded_context_parallel:
+            return None
+        shard_linear = getattr(self.self_attn, "sharded_cp_shard_linear", None)
+        if shard_linear is None:
+            return None
+        return shard_linear.prefetch(
+            group if group is not None else get_sharded_cp_group()
+        )
+
+    def _materialized_sharded_cp_attention_weights(
+        self,
+        prefetch: ShardedCPShardLinearPrefetch | None = None,
+    ):
+        if not self.enable_sharded_context_parallel:
+            return nullcontext()
+        shard_linear = getattr(self.self_attn, "sharded_cp_shard_linear", None)
+        if shard_linear is None:
+            return nullcontext()
+        if prefetch is not None:
+            if prefetch.layer_id != shard_linear.layer_id:
+                raise RuntimeError(
+                    "Sharded-CP Shard Linear prefetch was consumed by the "
+                    f"wrong layer: got layer {prefetch.layer_id}, expected "
+                    f"{shard_linear.layer_id}."
+                )
+            return prefetch.materialized()
+        return shard_linear.materialized(get_sharded_cp_group())
 
     def forward(
         self,
@@ -1183,6 +1388,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         llama_4_scaling: torch.Tensor | None = None,
+        sharded_cp_prefetch: ShardedCPShardLinearPrefetch | None = None,
     ) -> torch.Tensor:
         # Self Attention
         if residual is None:
@@ -1197,7 +1403,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         }
         if not self.use_mha:
             attn_kwargs["llama_4_scaling"] = llama_4_scaling
-        hidden_states = self.self_attn(**attn_kwargs)
+        with self._materialized_sharded_cp_attention_weights(sharded_cp_prefetch):
+            hidden_states = self.self_attn(**attn_kwargs)
 
         if (
             not isinstance(self.self_attn, DeepseekAttention)
@@ -1236,8 +1443,13 @@ class DeepseekV2Model(nn.Module):
 
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
+        parallel_config = vllm_config.parallel_config
         self.config = config
         self.device = current_platform.device_type
+        self.enable_sharded_context_parallel = (
+            parallel_config.enable_sharded_context_parallel
+        )
+        self.sharded_cp_token_range: ShardedCPTokenRange | None = None
 
         self.vocab_size = config.vocab_size
         self.is_v32 = hasattr(config, "index_topk")
@@ -1264,9 +1476,7 @@ class DeepseekV2Model(nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: DeepseekV2DecoderLayer(
-                vllm_config=vllm_config,
-                prefix=prefix,
-                topk_indices_buffer=topk_indices_buffer,
+                vllm_config, prefix, topk_indices_buffer=topk_indices_buffer
             ),
             prefix=f"{prefix}.layers",
         )
@@ -1281,18 +1491,66 @@ class DeepseekV2Model(nn.Module):
 
         self.aux_hidden_state_layers = tuple[int, ...]()
 
-        # Needed by load_weights
-        qk_nope_head_dim = getattr(config, "qk_nope_head_dim", 0)
-        qk_rope_head_dim = getattr(config, "qk_rope_head_dim", 0)
-        self.use_mha = config.model_type == "deepseek" or all(
-            dim == 0 for dim in (qk_nope_head_dim, qk_rope_head_dim)
-        )
-        self.num_redundant_experts = (
-            vllm_config.parallel_config.eplb_config.num_redundant_experts
-        )
-
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
+
+    def _maybe_scatter_to_sharded_cp(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        *,
+        reduce_hidden_states: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.enable_sharded_context_parallel:
+            self.sharded_cp_token_range = None
+            return hidden_states, positions
+
+        cp_group = get_sharded_cp_group()
+        if is_forward_context_available():
+            token_range = get_sharded_cp_token_range_from_forward_context(
+                get_forward_context(),
+                cp_group.rank_in_group,
+                cp_group.world_size,
+            )
+        else:
+            token_range = get_sharded_cp_token_range(
+                hidden_states.shape[0],
+                cp_group.rank_in_group,
+                cp_group.world_size,
+            )
+        self.sharded_cp_token_range = token_range
+        if reduce_hidden_states:
+            hidden_states = reduce_scatter_token_rows(
+                hidden_states,
+                token_range,
+                group=cp_group.device_group,
+            )
+        else:
+            hidden_states = slice_for_token_reduce_scatter(
+                hidden_states,
+                token_range,
+            )[: token_range.num_tokens]
+        positions = positions[token_range.start : token_range.end]
+        return hidden_states, positions
+
+    def _sharded_cp_forward_context(self):
+        if not self.enable_sharded_context_parallel:
+            return nullcontext()
+        if not is_forward_context_available():
+            return nullcontext()
+        return sharded_cp_forward_context(
+            get_forward_context(),
+            self.sharded_cp_token_range,
+        )
+
+    @staticmethod
+    def _release_pending_sharded_cp_prefetches(
+        prefetches: dict[int, ShardedCPShardLinearPrefetch],
+    ) -> None:
+        for prefetch in list(prefetches.values()):
+            if not prefetch.released:
+                prefetch.release()
+        prefetches.clear()
 
     def forward(
         self,
@@ -1302,6 +1560,7 @@ class DeepseekV2Model(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         if get_pp_group().is_first_rank:
+            reduce_hidden_states = False
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
@@ -1309,8 +1568,17 @@ class DeepseekV2Model(nn.Module):
                     raise ValueError(
                         "Either input_ids or inputs_embeds must be provided "
                         "to DeepseekV2Model.forward"
-                    )
-                hidden_states = self.embed_input_ids(input_ids)
+                )
+                if self.enable_sharded_context_parallel:
+                    hidden_states = self.embed_tokens.forward_parallel(input_ids)
+                    reduce_hidden_states = True
+                else:
+                    hidden_states = self.embed_input_ids(input_ids)
+            hidden_states, positions = self._maybe_scatter_to_sharded_cp(
+                hidden_states,
+                positions,
+                reduce_hidden_states=reduce_hidden_states,
+            )
             residual = None
         else:
             assert intermediate_tensors is not None
@@ -1331,16 +1599,59 @@ class DeepseekV2Model(nn.Module):
         else:
             llama_4_scaling = None
 
-        aux_hidden_states = []
-        for idx, layer in enumerate(
-            islice(self.layers, self.start_layer, self.end_layer),
-            start=self.start_layer,
-        ):
-            if idx in self.aux_hidden_state_layers:
-                aux_hidden_states.append(hidden_states + residual)
-            hidden_states, residual = layer(
-                positions, hidden_states, residual, llama_4_scaling
+        with self._sharded_cp_forward_context():
+            aux_hidden_states = []
+            layers = list(islice(self.layers, self.start_layer, self.end_layer))
+            prefetches: dict[int, ShardedCPShardLinearPrefetch] = {}
+            use_sharded_cp_this_batch = (
+                getattr(self, "sharded_cp_token_range", None) is not None
             )
+            prefetch_distance = 2 if use_sharded_cp_this_batch else 0
+            cp_group = (
+                get_sharded_cp_group()
+                if use_sharded_cp_this_batch and prefetch_distance > 0
+                else None
+            )
+
+            def maybe_prefetch(local_idx: int) -> None:
+                if (
+                    cp_group is None
+                    or local_idx < 0
+                    or local_idx >= len(layers)
+                    or local_idx in prefetches
+                ):
+                    return
+                layer = layers[local_idx]
+                prefetch = getattr(
+                    layer,
+                    "prefetch_sharded_cp_attention_weights",
+                    None,
+                )
+                if prefetch is not None:
+                    maybe_handle = prefetch(cp_group)
+                    if maybe_handle is not None:
+                        prefetches[local_idx] = maybe_handle
+
+            try:
+                for local_idx in range(min(prefetch_distance, len(layers))):
+                    maybe_prefetch(local_idx)
+
+                for local_idx, layer in enumerate(layers):
+                    idx = self.start_layer + local_idx
+                    maybe_prefetch(local_idx + prefetch_distance)
+                    if idx in self.aux_hidden_state_layers:
+                        aux_hidden_states.append(hidden_states + residual)
+                    sharded_cp_prefetch = prefetches.get(local_idx)
+                    hidden_states, residual = layer(
+                        positions,
+                        hidden_states,
+                        residual,
+                        llama_4_scaling,
+                        sharded_cp_prefetch=sharded_cp_prefetch,
+                    )
+                    prefetches.pop(local_idx, None)
+            finally:
+                self._release_pending_sharded_cp_prefetches(prefetches)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
@@ -1351,6 +1662,224 @@ class DeepseekV2Model(nn.Module):
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states
+
+    def release_sharded_cp_non_owner_weights(self) -> None:
+        if not self.enable_sharded_context_parallel:
+            return
+        cp_group = get_sharded_cp_group()
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
+            if isinstance(layer, PPMissingLayer):
+                continue
+            shard_linear = getattr(
+                layer.self_attn,
+                "sharded_cp_shard_linear",
+                None,
+            )
+            if shard_linear is not None:
+                shard_linear.release_non_owner(cp_group)
+
+
+class DeepseekV2MixtureOfExperts(MixtureOfExperts):
+    moe_mlp_layers: list[DeepseekV2MoE]
+    """
+    List of MoE MLP layers in the model.
+    """
+
+    def extract_moe_parameters(self, example_moe: DeepseekV2MoE | None):
+        if example_moe is None:
+            self.num_moe_layers = 0
+            self.num_expert_groups = 0
+            self.num_logical_experts = 0
+            self.num_physical_experts = 0
+            self.num_local_physical_experts = 0
+            self.num_routed_experts = 0
+            self.num_shared_experts = 0
+            self.num_redundant_experts = 0
+            logger.warning("DeepSeekV2: No DeepseekV2MoE layer found in model.layers.")
+        else:
+            self.num_logical_experts = example_moe.n_logical_experts
+            self.num_physical_experts = example_moe.n_physical_experts
+            self.num_local_physical_experts = example_moe.n_local_physical_experts
+            self.num_routed_experts = example_moe.n_routed_experts
+            self.num_shared_experts = example_moe.n_shared_experts
+            self.num_redundant_experts = example_moe.n_redundant_experts
+
+    def update_physical_experts_metadata(
+        self,
+        num_physical_experts: int,
+        num_local_physical_experts: int,
+    ) -> None:
+        assert self.num_local_physical_experts == num_local_physical_experts
+        self.num_physical_experts = num_physical_experts
+        self.num_local_physical_experts = num_local_physical_experts
+        self.num_redundant_experts = num_physical_experts - self.num_logical_experts
+        for moe in self.moe_mlp_layers:
+            moe.n_local_physical_experts = num_local_physical_experts
+            moe.n_physical_experts = num_physical_experts
+            moe.n_redundant_experts = self.num_redundant_experts
+            moe.experts.update_expert_map()
+
+
+class DeepseekV2ForCausalLM(
+    nn.Module,
+    SupportsPP,
+    DeepseekV2MixtureOfExperts,
+    SupportsLoRA,
+    SupportsEagle,
+    SupportsEagle3,
+):
+    packed_modules_mapping = {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+    model_cls = DeepseekV2Model
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__()
+        config = vllm_config.model_config.hf_config
+        quant_config = vllm_config.quant_config
+        self.config = config
+        self.quant_config = quant_config
+
+        qk_nope_head_dim = getattr(config, "qk_nope_head_dim", 0)
+        qk_rope_head_dim = getattr(config, "qk_rope_head_dim", 0)
+        self.use_mha = config.model_type == "deepseek" or all(
+            dim == 0 for dim in (qk_nope_head_dim, qk_rope_head_dim)
+        )
+
+        if self.use_mha:
+            self.packed_modules_mapping["qkv_proj"] = ["q_proj", "k_proj", "v_proj"]
+
+        # `packed_modules_mapping` needs to be modified before
+        # initializing DeepseekV2Model, as it is passed inplace to
+        # quantization config init and may be used to select the
+        # quant_method for relevant layers during initialization.
+        self.fuse_qkv_a_proj = (
+            hasattr(config, "q_lora_rank") and config.q_lora_rank is not None
+        )
+        if self.fuse_qkv_a_proj:
+            self.packed_modules_mapping["fused_qkv_a_proj"] = [
+                "q_a_proj",
+                "kv_a_proj_with_mqa",
+            ]
+
+        self.model = self.model_cls(
+            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+        )
+        if get_pp_group().is_last_rank:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=maybe_prefix(prefix, "lm_head"),
+            )
+        else:
+            self.lm_head = PPMissingLayer()
+        self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors
+        )
+        # Set MoE hyperparameters
+        self.num_moe_layers = (
+            self.config.num_hidden_layers - self.config.first_k_dense_replace
+        )
+        self.set_moe_parameters()
+        self._sharded_cp_logits_hidden_states_prepared = False
+
+    def set_moe_parameters(self):
+        self.expert_weights = []
+
+        self.num_expert_groups = getattr(self.config, "n_group", 1)
+
+        self.moe_layers = []
+        self.moe_mlp_layers = []
+        example_moe = None
+        for layer in self.model.layers:
+            if isinstance(layer, PPMissingLayer):
+                continue
+
+            assert isinstance(layer, DeepseekV2DecoderLayer)
+            if isinstance(layer.mlp, DeepseekV2MoE):
+                # Pick last one layer since the first ones may be dense layers.
+                example_moe = layer.mlp
+                self.moe_mlp_layers.append(layer.mlp)
+                self.moe_layers.append(layer.mlp.experts)
+
+        self.extract_moe_parameters(example_moe)
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model.aux_hidden_state_layers = layers
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        num_layers = len(self.model.layers)
+        return (2, num_layers // 2, num_layers - 3)
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed_input_ids(input_ids)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
+        if self.model.enable_sharded_context_parallel:
+            self._sharded_cp_logits_hidden_states_prepared = False
+        hidden_states = self.model(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        )
+        return hidden_states
+
+    def prepare_hidden_states_for_logits(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        if not self.model.enable_sharded_context_parallel:
+            return hidden_states
+
+        token_range = self.model.sharded_cp_token_range
+        if token_range is None:
+            if getattr(
+                self,
+                "_sharded_cp_logits_hidden_states_prepared",
+                False,
+            ):
+                return hidden_states
+            return hidden_states
+
+        cp_group = get_sharded_cp_group()
+        hidden_states = all_gather_token_rows(
+            hidden_states,
+            token_range,
+            group=cp_group.device_group,
+        )
+        self.model.sharded_cp_token_range = None
+        self._sharded_cp_logits_hidden_states_prepared = True
+        return hidden_states
+
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if self.model.enable_sharded_context_parallel:
+            token_range = self.model.sharded_cp_token_range
+            hidden_states = self.prepare_hidden_states_for_logits(hidden_states)
+            if token_range is not None:
+                self._sharded_cp_logits_hidden_states_prepared = False
+        logits = self.logits_processor(self.lm_head, hidden_states)
+        return logits
+
+    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        # Params for weights, fp8 weight scales, fp8 activation scales
+        # (param_name, weight_name, expert_id, shard_id)
+        return fused_moe_make_expert_params_mapping(
+            self,
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.n_routed_experts,
+            num_redundant_experts=0,
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         rocm_aiter_moe_shared_expert_enabled = (
@@ -1370,14 +1899,6 @@ class DeepseekV2Model(nn.Module):
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
         ]
-        # Fused indexer wk + weights_proj (shard 0 = wk, shard 1 = weights_proj)
-        _pending_wk_fp8: dict = {}  # When WK is in FP8, we dequant to BF16 for fusion
-        indexer_fused_mapping = [
-            ("wk_weights_proj", "wk", 0),
-            ("wk_weights_proj", "weights_proj", 1),
-        ]
-        stacked_params_mapping.extend(indexer_fused_mapping)
-
         if self.use_mha:
             stacked_params_mapping.extend(mha_params_mapping)
         else:
@@ -1399,7 +1920,6 @@ class DeepseekV2Model(nn.Module):
             num_redundant_experts=self.num_redundant_experts,
         )
 
-        pp_missing_layer_names = get_pp_missing_layer_names(self)
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
@@ -1413,16 +1933,6 @@ class DeepseekV2Model(nn.Module):
             is_fusion_moe_shared_experts_layer = (
                 rocm_aiter_moe_shared_expert_enabled and ("mlp.shared_experts" in name)
             )
-
-            if _try_load_fp8_indexer_wk(
-                name,
-                loaded_weight,
-                _pending_wk_fp8,
-                params_dict,
-                loaded_params,
-                pp_missing_layer_names,
-            ):
-                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
@@ -1577,177 +2087,8 @@ class DeepseekV2Model(nn.Module):
 
         return loaded_params
 
-
-class DeepseekV2MixtureOfExperts(MixtureOfExperts):
-    moe_mlp_layers: list[DeepseekV2MoE]
-    """
-    List of MoE MLP layers in the model.
-    """
-
-    def extract_moe_parameters(self, example_moe: DeepseekV2MoE | None):
-        if example_moe is None:
-            self.num_moe_layers = 0
-            self.num_expert_groups = 0
-            self.num_logical_experts = 0
-            self.num_physical_experts = 0
-            self.num_local_physical_experts = 0
-            self.num_routed_experts = 0
-            self.num_shared_experts = 0
-            self.num_redundant_experts = 0
-            logger.warning("DeepSeekV2: No DeepseekV2MoE layer found in model.layers.")
-        else:
-            self.num_logical_experts = example_moe.n_logical_experts
-            self.num_physical_experts = example_moe.n_physical_experts
-            self.num_local_physical_experts = example_moe.n_local_physical_experts
-            self.num_routed_experts = example_moe.n_routed_experts
-            self.num_shared_experts = example_moe.n_shared_experts
-            self.num_redundant_experts = example_moe.n_redundant_experts
-
-    def update_physical_experts_metadata(
-        self,
-        num_physical_experts: int,
-        num_local_physical_experts: int,
-    ) -> None:
-        assert self.num_local_physical_experts == num_local_physical_experts
-        self.num_physical_experts = num_physical_experts
-        self.num_local_physical_experts = num_local_physical_experts
-        self.num_redundant_experts = num_physical_experts - self.num_logical_experts
-        for moe in self.moe_mlp_layers:
-            moe.n_local_physical_experts = num_local_physical_experts
-            moe.n_physical_experts = num_physical_experts
-            moe.n_redundant_experts = self.num_redundant_experts
-            moe.experts.update_expert_map()
-
-
-class DeepseekV2ForCausalLM(
-    nn.Module,
-    SupportsPP,
-    DeepseekV2MixtureOfExperts,
-    SupportsLoRA,
-    SupportsEagle,
-    SupportsEagle3,
-):
-    packed_modules_mapping = {
-        "gate_up_proj": ["gate_proj", "up_proj"],
-    }
-    model_cls = DeepseekV2Model
-
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-        super().__init__()
-        config = vllm_config.model_config.hf_config
-        quant_config = vllm_config.quant_config
-        self.config = config
-        self.quant_config = quant_config
-
-        qk_nope_head_dim = getattr(config, "qk_nope_head_dim", 0)
-        qk_rope_head_dim = getattr(config, "qk_rope_head_dim", 0)
-        self.use_mha = config.model_type == "deepseek" or all(
-            dim == 0 for dim in (qk_nope_head_dim, qk_rope_head_dim)
-        )
-
-        if self.use_mha:
-            self.packed_modules_mapping["qkv_proj"] = ["q_proj", "k_proj", "v_proj"]
-
-        # `packed_modules_mapping` needs to be modified before
-        # initializing DeepseekV2Model, as it is passed inplace to
-        # quantization config init and may be used to select the
-        # quant_method for relevant layers during initialization.
-        self.fuse_qkv_a_proj = (
-            hasattr(config, "q_lora_rank") and config.q_lora_rank is not None
-        )
-        if self.fuse_qkv_a_proj:
-            self.packed_modules_mapping["fused_qkv_a_proj"] = [
-                "q_a_proj",
-                "kv_a_proj_with_mqa",
-            ]
-
-        self.model = self.model_cls(
-            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
-        )
-        if get_pp_group().is_last_rank:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=quant_config,
-                prefix=maybe_prefix(prefix, "lm_head"),
-            )
-        else:
-            self.lm_head = PPMissingLayer()
-        self.logits_processor = LogitsProcessor(config.vocab_size)
-        self.make_empty_intermediate_tensors = (
-            self.model.make_empty_intermediate_tensors
-        )
-        # Set MoE hyperparameters
-        self.num_moe_layers = (
-            self.config.num_hidden_layers - self.config.first_k_dense_replace
-        )
-        self.set_moe_parameters()
-
-    def set_moe_parameters(self):
-        self.expert_weights = []
-
-        self.num_expert_groups = getattr(self.config, "n_group", 1)
-
-        self.moe_layers = []
-        self.moe_mlp_layers = []
-        example_moe = None
-        for layer in self.model.layers:
-            if isinstance(layer, PPMissingLayer):
-                continue
-
-            assert isinstance(layer, DeepseekV2DecoderLayer)
-            if isinstance(layer.mlp, DeepseekV2MoE):
-                # Pick last one layer since the first ones may be dense layers.
-                example_moe = layer.mlp
-                self.moe_mlp_layers.append(layer.mlp)
-                self.moe_layers.append(layer.mlp.experts)
-
-        self.extract_moe_parameters(example_moe)
-
-    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
-        self.model.aux_hidden_state_layers = layers
-
-    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
-        num_layers = len(self.model.layers)
-        return (2, num_layers // 2, num_layers - 3)
-
-    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.embed_input_ids(input_ids)
-
-    def forward(
-        self,
-        input_ids: torch.Tensor | None,
-        positions: torch.Tensor,
-        intermediate_tensors: IntermediateTensors | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
-        hidden_states = self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
-        )
-        return hidden_states
-
-    def compute_logits(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor | None:
-        logits = self.logits_processor(self.lm_head, hidden_states)
-        return logits
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        return fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts,
-            num_redundant_experts=0,
-        )
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+    def post_process_weights_after_loading(self) -> None:
+        self.model.release_sharded_cp_non_owner_weights()
 
 
 class DeepseekForCausalLM(DeepseekV2ForCausalLM):
@@ -1773,8 +2114,6 @@ def get_spec_layer_idx_from_weight_name(
     ):
         layer_idx = config.num_hidden_layers
         for i in range(config.num_nextn_predict_layers):
-            if weight_name.startswith(
-                f"model.layers.{layer_idx + i}."
-            ) or weight_name.startswith(f"layers.{layer_idx + i}."):
+            if weight_name.startswith(f"model.layers.{layer_idx + i}."):
                 return layer_idx + i
     return None

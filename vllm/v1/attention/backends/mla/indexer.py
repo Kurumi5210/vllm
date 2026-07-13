@@ -195,6 +195,9 @@ class DeepSeekV32IndexerDecodeMetadata:
     decode_lens: torch.Tensor
     requires_padding: bool
     schedule_metadata: torch.Tensor
+    use_large_context_topk: bool = False
+    offsets: torch.Tensor | None = None
+    block_size: int = 64
 
 
 @dataclass
@@ -214,6 +217,12 @@ class DeepseekV32IndexerMetadata:
 
     decode: DeepSeekV32IndexerDecodeMetadata | None = None
     prefill: DeepseekV32IndexerPrefillMetadata | None = None
+    num_reqs: int = 0
+    max_query_len: int = 0
+    num_actual_tokens: int = 0
+    query_start_loc: torch.Tensor | None = None
+    head_dim: int = 128
+    k_is_global_compact: bool = False
 
 
 def get_max_prefill_buffer_size(vllm_config: VllmConfig):
@@ -620,18 +629,34 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     self.num_sms,
                 )
 
+            use_large_context_topk = (
+                batch_size <= 128 and common_attn_metadata.max_seq_len > 8192
+            )
+            offsets = (
+                self.offsets_buffer[:max_decode_len]
+                if use_native and max_decode_len > 1
+                else None
+            )
             decode_metadata = DeepSeekV32IndexerDecodeMetadata(
                 block_table=block_table,
                 seq_lens=seq_lens,
                 decode_lens=decode_lens,
                 requires_padding=requires_padding,
                 schedule_metadata=self.scheduler_metadata_buffer,
+                use_large_context_topk=use_large_context_topk,
+                offsets=offsets,
+                block_size=self.kv_cache_spec.storage_block_size,
             )
 
         attn_metadata = DeepseekV32IndexerMetadata(
             seq_lens=common_attn_metadata.seq_lens,
             max_seq_len=common_attn_metadata.max_seq_len,
             slot_mapping=compressed_slot_mapping,
+            num_reqs=common_attn_metadata.num_reqs,
+            max_query_len=common_attn_metadata.max_query_len,
+            num_actual_tokens=common_attn_metadata.num_actual_tokens,
+            query_start_loc=common_attn_metadata.query_start_loc,
+            head_dim=self.kv_cache_spec.head_size,
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
             num_prefills=num_prefills,

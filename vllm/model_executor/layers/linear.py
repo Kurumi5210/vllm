@@ -283,6 +283,13 @@ class LinearBase(PluggableLayer):
                 param.tp_rank = self.tp_rank
                 param.tp_size = self.tp_size
 
+    def _empty_output(self, input_: torch.Tensor, output_size: int) -> torch.Tensor:
+        output_shape = (*input_.shape[:-1], output_size)
+        return input_.new_empty(output_shape)
+
+    def _has_empty_batch(self, input_: torch.Tensor) -> bool:
+        return 0 in input_.shape[:-1]
+
 
 # --8<-- [start:replicated_linear]
 @PluggableLayer.register("replicated_linear")
@@ -375,7 +382,12 @@ class ReplicatedLinear(LinearBase):
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
         bias = self.bias if not self.skip_bias_add else None
 
-        output = self.quant_method.apply(self, x, bias)
+        if self._has_empty_batch(x):
+            output = self._empty_output(x, self.output_size)
+            if bias is not None:
+                output = output + bias
+        else:
+            output = self.quant_method.apply(self, x, bias)
 
         if not self.return_bias:
             return output
@@ -552,7 +564,15 @@ class ColumnParallelLinear(LinearBase):
         bias = self.bias if not self.skip_bias_add else None
 
         # Matrix multiply.
-        output_parallel = self.quant_method.apply(self, input_, bias)
+        assert self.quant_method is not None
+        if self._has_empty_batch(input_):
+            output_parallel = self._empty_output(
+                input_, self.output_size_per_partition
+            )
+            if bias is not None:
+                output_parallel = output_parallel + bias
+        else:
+            output_parallel = self.quant_method.apply(self, input_, bias)
 
         if self.gather_output and self.tp_size > 1:
             # All-gather across the partitions.
@@ -1641,7 +1661,14 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        output_parallel = self.quant_method.apply(self, input_parallel, bias_)
+        if self._has_empty_batch(input_parallel):
+            output_parallel = self._empty_output(
+                input_parallel, self.output_size_per_partition
+            )
+            if bias_ is not None:
+                output_parallel = output_parallel + bias_
+        else:
+            output_parallel = self.quant_method.apply(self, input_parallel, bias_)
 
         if self.reduce_results and self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output_parallel)

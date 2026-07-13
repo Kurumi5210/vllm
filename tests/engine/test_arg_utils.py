@@ -4,7 +4,9 @@
 import json
 from argparse import ArgumentError
 from contextlib import AbstractContextManager, nullcontext
+from types import SimpleNamespace
 from typing import Annotated, Literal
+from unittest.mock import patch
 
 import pytest
 from pydantic import Field
@@ -455,6 +457,168 @@ def test_attention_config():
     assert args is not None
     engine_args = EngineArgs.from_cli_args(args)
     with pytest.raises(ValueError, match="mutually exclusive"):
+        engine_args.create_engine_config()
+
+
+@pytest.mark.skip_global_cleanup
+def test_enable_sharded_context_parallel_cli_arg():
+    from vllm.platforms.cpu import CpuPlatform
+
+    with patch("vllm.platforms.current_platform", CpuPlatform()):
+        parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    default_args = parser.parse_args([])
+    default_engine_args = EngineArgs.from_cli_args(default_args)
+    assert default_engine_args.enable_sharded_context_parallel is False
+
+    args = parser.parse_args(["--enable-sharded-context-parallel"])
+
+    engine_args = EngineArgs.from_cli_args(args)
+
+    assert engine_args.enable_sharded_context_parallel is True
+
+
+@pytest.mark.skip_global_cleanup
+def test_enable_sharded_context_parallel_flows_to_parallel_config(monkeypatch):
+    from vllm.platforms.cpu import CpuPlatform
+
+    fake_model_config = SimpleNamespace(
+        model="fake-model",
+        model_weights="fake-model",
+        tokenizer="fake-tokenizer",
+        hf_config=SimpleNamespace(index_topk=2048),
+        hf_text_config=SimpleNamespace(),
+        use_mla=True,
+        is_moe=True,
+        is_attention_free=False,
+        is_encoder_decoder=False,
+        is_multimodal_model=False,
+        runner_type="generate",
+        max_model_len=16,
+        skip_tokenizer_init=True,
+        quantization=None,
+        enforce_eager=False,
+        pooler_config=None,
+        architecture="FakeForCausalLM",
+        dtype=None,
+    )
+    fake_model_config.get_sliding_window = lambda: None
+
+    class FakeVllmConfig:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    monkeypatch.setattr(
+        "vllm.engine.arg_utils.current_platform",
+        CpuPlatform(),
+    )
+    monkeypatch.setattr(
+        "vllm.engine.arg_utils.is_cloud_storage",
+        lambda model: True,
+    )
+    monkeypatch.setattr(
+        "vllm.engine.arg_utils.is_interleaved",
+        lambda hf_text_config: False,
+    )
+    monkeypatch.setattr(
+        EngineArgs,
+        "create_model_config",
+        lambda self: fake_model_config,
+    )
+    monkeypatch.setattr(EngineArgs, "_check_feature_supported", lambda self: None)
+    monkeypatch.setattr(
+        EngineArgs,
+        "_set_default_chunked_prefill_and_prefix_caching_args",
+        lambda self, model_config: (
+            setattr(self, "enable_chunked_prefill", True),
+            setattr(self, "enable_prefix_caching", False),
+        ),
+    )
+    monkeypatch.setattr(
+        EngineArgs,
+        "_set_default_max_num_seqs_and_batched_tokens_args",
+        lambda self, usage_context, model_config: (
+            setattr(self, "max_num_batched_tokens", 16),
+            setattr(self, "max_num_seqs", 1),
+        ),
+    )
+    monkeypatch.setattr("vllm.engine.arg_utils.VllmConfig", FakeVllmConfig)
+
+    engine_args = EngineArgs(
+        model="fake-model",
+        tensor_parallel_size=2,
+        enable_sharded_context_parallel=True,
+    )
+    config = engine_args.create_engine_config()
+
+    assert config.parallel_config.enable_sharded_context_parallel is True
+
+
+@pytest.mark.skip_global_cleanup
+def test_enable_sharded_context_parallel_rejects_incompatible_cli_topology(
+    monkeypatch,
+):
+    from vllm.platforms.cpu import CpuPlatform
+
+    fake_model_config = SimpleNamespace(
+        model="fake-model",
+        model_weights="fake-model",
+        tokenizer="fake-tokenizer",
+        hf_config=SimpleNamespace(index_topk=2048),
+        hf_text_config=SimpleNamespace(),
+        use_mla=True,
+        is_moe=False,
+        is_attention_free=False,
+        is_encoder_decoder=False,
+        is_multimodal_model=False,
+        runner_type="generate",
+        max_model_len=16,
+        skip_tokenizer_init=True,
+        quantization=None,
+        get_sliding_window=lambda: None,
+    )
+
+    monkeypatch.setattr(
+        "vllm.engine.arg_utils.current_platform",
+        CpuPlatform(),
+    )
+    monkeypatch.setattr(
+        "vllm.engine.arg_utils.is_cloud_storage",
+        lambda model: True,
+    )
+    monkeypatch.setattr(
+        "vllm.engine.arg_utils.is_interleaved",
+        lambda hf_text_config: False,
+    )
+    monkeypatch.setattr(
+        EngineArgs,
+        "create_model_config",
+        lambda self: fake_model_config,
+    )
+    monkeypatch.setattr(EngineArgs, "_check_feature_supported", lambda self: None)
+    monkeypatch.setattr(
+        EngineArgs,
+        "_set_default_chunked_prefill_and_prefix_caching_args",
+        lambda self, model_config: (
+            setattr(self, "enable_chunked_prefill", True),
+            setattr(self, "enable_prefix_caching", False),
+        ),
+    )
+    monkeypatch.setattr(
+        EngineArgs,
+        "_set_default_max_num_seqs_and_batched_tokens_args",
+        lambda self, usage_context, model_config: (
+            setattr(self, "max_num_batched_tokens", 16),
+            setattr(self, "max_num_seqs", 1),
+        ),
+    )
+
+    engine_args = EngineArgs(
+        model="fake-model",
+        tensor_parallel_size=1,
+        enable_sharded_context_parallel=True,
+    )
+
+    with pytest.raises(ValueError, match="tensor_parallel_size > 1"):
         engine_args.create_engine_config()
 
 

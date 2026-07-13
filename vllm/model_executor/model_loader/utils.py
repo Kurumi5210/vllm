@@ -130,6 +130,10 @@ def process_weights_after_loading(
     if model_config.quantization == "torchao":
         set_torchao_reload_attrs(model, model_config)
 
+    post_process = getattr(model, "post_process_weights_after_loading", None)
+    if post_process is not None:
+        post_process()
+
 
 @contextmanager
 def device_loading_context(module: torch.nn.Module, target_device: torch.device):

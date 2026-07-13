@@ -96,6 +96,7 @@ class XPUMLASparseMetadata(AttentionMetadata):
 
     block_size: int = 1
     topk_tokens: int = 2048
+    topk_indices_are_global_compact_offsets: bool = False
 
 
 @dataclass
@@ -247,13 +248,16 @@ class XPUMLASparseImpl(SparseMLAAttentionImpl[XPUMLASparseMetadata]):
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
 
-        topk_indices_global = triton_convert_req_index_to_global_index(
-            attn_metadata.req_id_per_token,
-            attn_metadata.block_table,
-            topk_indices,
-            BLOCK_SIZE=attn_metadata.block_size,
-            NUM_TOPK_TOKENS=attn_metadata.topk_tokens,
-        )
+        if attn_metadata.topk_indices_are_global_compact_offsets:
+            topk_indices_global = topk_indices
+        else:
+            topk_indices_global = triton_convert_req_index_to_global_index(
+                attn_metadata.req_id_per_token,
+                attn_metadata.block_table,
+                topk_indices,
+                BLOCK_SIZE=attn_metadata.block_size,
+                NUM_TOPK_TOKENS=attn_metadata.topk_tokens,
+            )
 
         attn_out = self._forward_bf16_kv(
             q, kv_c_and_k_pe_cache, topk_indices_global, attn_metadata

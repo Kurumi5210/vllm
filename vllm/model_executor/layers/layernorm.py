@@ -77,21 +77,20 @@ class RMSNorm(CustomOp):
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward()."""
-        if residual is None:
-            return ir.ops.rms_norm(
-                x,
-                self.weight.data if self.pass_weight else None,
-                self.variance_epsilon,
-                self.variance_size_override,
-            )
-        else:
-            return ir.ops.fused_add_rms_norm.maybe_inplace(
-                x,
-                residual,
-                self.weight.data if self.pass_weight_add else None,
-                self.variance_epsilon,
-                self.variance_size_override,
-            )
+        if 0 in x.shape[:-1]:
+            if residual is None:
+                return x
+            return x, residual
+
+        return self.forward_static(
+            x,
+            self.variance_epsilon,
+            self.hidden_size,
+            x.dtype,
+            self.weight.data if self.has_weight else None,
+            residual,
+            self.variance_size_override,
+        )
 
     def forward_cuda(
         self,
@@ -107,6 +106,108 @@ class RMSNorm(CustomOp):
                 self.weight.data,
                 self.variance_epsilon,
                 residual=residual,
+            )
+
+        if 0 in x.shape[:-1]:
+            if residual is None:
+                return x
+            return x, residual
+
+        if self.variance_size_override is not None:
+            return self.forward_native(x, residual)
+
+        # Optional Oink SM100 fast path (no residual). This path is
+        # torch.compile-friendly via torch.ops.oink.rmsnorm and preserves
+        # 2D layouts (including padded rows) when using the Oink
+        # pointer-based kernel.
+        if (
+            residual is None
+            and getattr(self, "_use_oink_rmsnorm", False)
+            and x.is_cuda
+            and x.dim() >= 2
+            and self.has_weight
+            and not vllm_is_batch_invariant()
+            and self.weight.data.dtype == x.dtype
+            and self.weight.data.is_contiguous()
+        ):
+            orig_shape = x.shape
+            hidden_size = orig_shape[-1]
+            if _can_view_as_2d(x):
+                x_2d = x.view(-1, hidden_size)
+                if _is_oink_stride_compatible_2d(x_2d):
+                    y_2d = _oink_ops.rmsnorm(
+                        x_2d,
+                        self.weight.data,
+                        self.variance_epsilon,
+                    )
+                    return y_2d.view(orig_shape)
+
+        # Optional Oink SM100 fast path (fused residual-add + RMSNorm, in-place).
+        # This mirrors vLLM's fused_add_rms_norm semantics by mutating both
+        # `x` (normalized output) and `residual` (residual-out buffer).
+        if (
+            residual is not None
+            and getattr(self, "_use_oink_fused_add_rmsnorm", False)
+            and x.is_cuda
+            and residual.is_cuda
+            and x.shape == residual.shape
+            and x.dtype == residual.dtype
+            and x.dim() >= 2
+            and self.has_weight
+            and not vllm_is_batch_invariant()
+            and self.weight.data.dtype == x.dtype
+            and self.weight.data.is_contiguous()
+        ):
+            orig_shape = x.shape
+            hidden_size = orig_shape[-1]
+            if _can_view_as_2d(x) and _can_view_as_2d(residual):
+                x_2d = x.view(-1, hidden_size)
+                res_2d = residual.view(-1, hidden_size)
+
+                # The Oink in-place pointer path supports the common vLLM
+                # layout where:
+                # - `x` may be strided/padded row-major (stride(1) == 1), and
+                # - `residual` is contiguous row-major ([M, N] with stride(0) == N).
+                # If these conditions are not met, fall back to vLLM's built-in
+                # fused kernel.
+                if (
+                    _is_oink_stride_compatible_2d(x_2d)
+                    and _is_oink_stride_compatible_2d(res_2d)
+                    and res_2d.is_contiguous()
+                ):
+                    _oink_ops.fused_add_rms_norm_(
+                        x_2d,
+                        res_2d,
+                        self.weight.data,
+                        self.variance_epsilon,
+                    )
+                    return x, residual
+
+        add_residual = residual is not None
+        if add_residual:
+            return fused_add_rms_norm(
+                x, residual, self.weight.data, self.variance_epsilon
+            )
+        else:
+            return rms_norm(x, self.weight.data, self.variance_epsilon)
+
+    def forward_hip(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if 0 in x.shape[:-1]:
+            if residual is None:
+                return x
+            return x, residual
+
+        if self.variance_size_override is not None:
+            return self.forward_native(x, residual)
+
+        add_residual = residual is not None
+        if add_residual:
+            return self.rocm_norm_func_with_add(
+                x, residual, self.weight.data, self.variance_epsilon
             )
 
         return self.forward_native(x, residual)

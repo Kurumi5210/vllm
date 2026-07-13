@@ -127,6 +127,21 @@ def test_enabled_ops_invalid(env: str):
             RMSNorm(1024).enabled()
 
 
+def test_empty_batch_rms_norm_and_silu_and_mul(default_vllm_config):
+    rms_norm = RMSNorm(8)
+    x = torch.empty(0, 8)
+    residual = torch.empty(0, 8)
+
+    out = rms_norm.forward_native(x)
+    out_with_residual, residual_out = rms_norm.forward_native(x, residual)
+    activated = SiluAndMul.forward_native(torch.empty(0, 16))
+
+    assert out.shape == (0, 8)
+    assert out_with_residual.shape == (0, 8)
+    assert residual_out.shape == (0, 8)
+    assert activated.shape == (0, 8)
+
+
 @pytest.mark.parametrize(
     "use_rocm_aiter", [True, False] if current_platform.is_rocm() else [False]
 )
