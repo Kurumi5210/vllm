@@ -897,9 +897,27 @@ class CrossDPScheduler(Scheduler):
                 num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens
             )
 
-            """
-            TODO(AoChen): Encoder inputs scheduling is not implemented yet.
-            """
+            # Schedule encoder inputs (mirrors the base scheduler so the model
+            # runner is told which multimodal items to compute/load this step).
+            # Without this, encoder_cache stays empty on this rank and a
+            # (re-)prefill of a multimodal request hits an encoder cache miss
+            # in _gather_mm_embeddings.
+            encoder_inputs_to_schedule: list[int] | None = None
+            external_load_encoder_input: list[int] = []
+            new_encoder_compute_budget = encoder_compute_budget
+            if request.has_encoder_inputs:
+                (
+                    encoder_inputs_to_schedule,
+                    num_new_tokens,
+                    new_encoder_compute_budget,
+                    external_load_encoder_input,
+                ) = self._try_schedule_encoder_inputs(
+                    request,
+                    request.num_computed_tokens,
+                    num_new_tokens,
+                    encoder_compute_budget,
+                    shift_computed_tokens=1 if self.use_eagle else 0,
+                )
 
             # [vllm add]
             if self.need_mamba_block_aligned_split:
@@ -968,6 +986,19 @@ class CrossDPScheduler(Scheduler):
                                 r in request.cp_ranks for r in candidate.cp_ranks
                             ):
                                 preempted_req = self.running.pop(i)
+                                # Restore the encoder compute budget if the
+                                # preempted request had encoder inputs
+                                # scheduled earlier in this step.
+                                if preempted_req.request_id in scheduled_encoder_inputs:
+                                    preempted_encoder_inputs = (
+                                        scheduled_encoder_inputs.pop(
+                                            preempted_req.request_id
+                                        )
+                                    )
+                                    encoder_compute_budget += sum(
+                                        preempted_req.get_num_encoder_embeds(i)
+                                        for i in preempted_encoder_inputs
+                                    )
                                 break
 
                         if preempted_req is None:
@@ -994,6 +1025,21 @@ class CrossDPScheduler(Scheduler):
                 break
 
             assert len(request.cp_ranks) == len(new_blocks)
+            # Encoder-related: finalize encoder input scheduling.
+            if encoder_inputs_to_schedule:
+                scheduled_encoder_inputs[request.request_id] = (
+                    encoder_inputs_to_schedule
+                )
+                for i in encoder_inputs_to_schedule:
+                    self.encoder_cache_manager.allocate(request, i)
+                    if self.ec_connector is not None:
+                        self.ec_connector.update_state_after_alloc(request, i)
+                encoder_compute_budget = new_encoder_compute_budget
+            if external_load_encoder_input:
+                for i in external_load_encoder_input:
+                    self.encoder_cache_manager.allocate(request, i)
+                    if self.ec_connector is not None:
+                        self.ec_connector.update_state_after_alloc(request, i)
             # Schedule the request.
             for i, rank in enumerate(request.cp_ranks):
                 scheduled_running_reqs[rank].append(request)
@@ -1105,9 +1151,12 @@ class CrossDPScheduler(Scheduler):
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
 
-                # encoder_inputs_to_schedule = None
-                # external_load_encoder_input = []
-                # new_encoder_compute_budget = encoder_compute_budget
+                # Encoder-related trackers, filled in by
+                # _try_schedule_encoder_inputs when the request has multimodal
+                # inputs that overlap the scheduled range.
+                encoder_inputs_to_schedule: list[int] | None = None
+                external_load_encoder_input: list[int] = []
+                new_encoder_compute_budget = encoder_compute_budget
 
                 if load_kv_async:
                     # KVTransfer: loading remote KV, do not allocate for new work.
@@ -1154,6 +1203,29 @@ class CrossDPScheduler(Scheduler):
 
                     num_new_tokens = min(num_new_tokens, effective_budget)
                     assert num_new_tokens > 0
+
+                    # Schedule encoder inputs. This may shrink num_new_tokens
+                    # (e.g. roll back to just before an encoder input that
+                    # cannot be computed/loaded this step), and records which
+                    # multimodal items the model runner must compute/load.
+                    if request.has_encoder_inputs:
+                        (
+                            encoder_inputs_to_schedule,
+                            num_new_tokens,
+                            new_encoder_compute_budget,
+                            external_load_encoder_input,
+                        ) = self._try_schedule_encoder_inputs(
+                            request,
+                            num_computed_tokens,
+                            num_new_tokens,
+                            encoder_compute_budget,
+                            shift_computed_tokens=1 if self.use_eagle else 0,
+                        )
+                        if num_new_tokens == 0:
+                            # An encoder input overlaps the scheduled range but
+                            # cannot be scheduled this step (encoder budget or
+                            # cache exhausted). Stop scheduling waiting reqs.
+                            break
 
                     # Determine the request type for batch homogeneity check.
                     # For waiting requests, use num_computed_tokens (which may
@@ -1213,6 +1285,10 @@ class CrossDPScheduler(Scheduler):
                 if selected_dp is None:
                     # Cannot place this request on any rank right now.
                     # Skip it and try smaller requests behind it.
+                    # Undo any encoder-cache references touched while trying,
+                    # since the request will not run this step.
+                    if request.has_encoder_inputs:
+                        self.encoder_cache_manager.free(request)
                     self.waiting.pop_request()
                     skipped_waiting_requests.prepend_request(request)
                     continue
@@ -1236,6 +1312,10 @@ class CrossDPScheduler(Scheduler):
                 )
                 if new_blocks is None:
                     # The request cannot be scheduled.
+                    # NOTE: untouch the encoder cache manager, which may have
+                    # been updated while scheduling encoder inputs above.
+                    if request.has_encoder_inputs:
+                        self.encoder_cache_manager.free(request)
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -1324,6 +1404,21 @@ class CrossDPScheduler(Scheduler):
                 request.prev_cp_ranks = []
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                # Encoder-related: finalize encoder input scheduling.
+                if encoder_inputs_to_schedule:
+                    scheduled_encoder_inputs[request.request_id] = (
+                        encoder_inputs_to_schedule
+                    )
+                    for i in encoder_inputs_to_schedule:
+                        self.encoder_cache_manager.allocate(request, i)
+                        if self.ec_connector is not None:
+                            self.ec_connector.update_state_after_alloc(request, i)
+                    encoder_compute_budget = new_encoder_compute_budget
+                if external_load_encoder_input:
+                    for i in external_load_encoder_input:
+                        self.encoder_cache_manager.allocate(request, i)
+                        if self.ec_connector is not None:
+                            self.ec_connector.update_state_after_alloc(request, i)
                 # Count the number of prefix cached tokens.
                 if request.num_cached_tokens < 0:
                     request.num_cached_tokens = num_computed_tokens
@@ -1399,6 +1494,12 @@ class CrossDPScheduler(Scheduler):
 
         none_tokens_in_peer_sched = all([sum(num_scheduled_tokens[idx].values()) == 0 for idx in range(self.cp_world_size)])
 
+        # Capture encoder-cache evictions ONCE: get_freed_mm_hashes() clears the
+        # internal list on each call, so calling it inside the per-rank loop
+        # below would only notify the first non-empty rank and leave the others
+        # with stale encoder_cache entries.
+        freed_encoder_mm_hashes = self.encoder_cache_manager.get_freed_mm_hashes()
+
         for idx in range(self.cp_world_size):
             new_block_ids_to_zero = (
                 (self.kv_cache_manager.take_new_block_ids(idx) or None)
@@ -1429,7 +1530,7 @@ class CrossDPScheduler(Scheduler):
                         # It contains the request IDs that are finished in between
                         # the previous and the current steps.
                         finished_req_ids=self.finished_req_ids[idx],
-                        free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
+                        free_encoder_mm_hashes=freed_encoder_mm_hashes,
                         new_block_ids_to_zero=new_block_ids_to_zero,
                         cp_rank=idx,
                         cp_rank_scheduled_tokens=cp_rank_scheduled_tokens[idx],
@@ -1452,6 +1553,18 @@ class CrossDPScheduler(Scheduler):
                 )
                 scheduler_output.kv_connector_metadata = meta
             self.connector.clear_reqs_need_recv() # debug
+
+        # EC connector: build the encoder-cache transfer metadata once per step
+        # and attach it to the rank-0 output (the rank that runs the multimodal
+        # encoder). Without this, the mm_hashes registered via
+        # update_state_after_alloc are never consumed, so the consumer side
+        # never loads the encoder caches.
+        if self.ec_connector is not None and total_scheduler_output:
+            total_scheduler_output[0].ec_connector_metadata = (
+                self.ec_connector.build_connector_meta(
+                    total_scheduler_output[0]
+                )
+            )
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             # self._update_after_schedule(scheduler_output)
