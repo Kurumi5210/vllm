@@ -261,6 +261,34 @@ class CrossDPScheduler(Scheduler):
         # taken, preventing the counter from going negative.
         self.long_running_req_ids: set[str] = set()
 
+        # Per-rank encoder cache managers.
+        #
+        # There is ONE scheduler process but N separate worker processes,
+        # each with its own rank-local `encoder_cache` dict in the model
+        # runner (gpu_model_runner.py: `self.encoder_cache[mm_hash] = ...`).
+        # A single global manager cannot mirror N independent caches:
+        #   - A DP request preempted from rank A and rescheduled on rank B
+        #     would be falsely reported as "cached" (the mm_hash is still in
+        #     the global manager's `freeable`) and never recomputed, so rank
+        #     B's local encoder_cache misses it -> assert in
+        #     `_gather_mm_embeddings` ("Encoder cache miss for {mm_hash}").
+        #   - A shared `scheduled_encoder_inputs` dict would make every rank
+        #     iterate other ranks' req_ids, but a worker's `self.requests` is
+        #     rank-scoped (populated only from its own `scheduled_new_reqs`),
+        #     causing a KeyError in `_batch_mm_inputs_from_scheduler`.
+        # Model each rank's cache independently, keyed by cp_rank.
+        encoder_cache_size = self.encoder_cache_manager.cache_size
+        manager_cls = (EncoderDecoderCacheManager if self.is_encoder_decoder
+                       else EncoderCacheManager)
+        self.encoder_cache_managers: list[EncoderCacheManager] = [
+            manager_cls(cache_size=encoder_cache_size)
+            for _ in range(self.cp_world_size)
+        ]
+        # Rank-0 handle retained for any inherited base method that still
+        # expects a single manager; the per-rank-aware overrides below use
+        # `self.encoder_cache_managers` instead.
+        self.encoder_cache_manager = self.encoder_cache_managers[0]
+
     def _mark_long_running(self, request: Request) -> None:
         """Mark *request* as occupying a long-request slot.
 
@@ -323,7 +351,11 @@ class CrossDPScheduler(Scheduler):
             # encoder inputs are always part of the prompt, not the output,
             # and thus are unaffected by speculative decoding.
             if request.has_encoder_inputs:
-                self._free_encoder_inputs(request)
+                # Free on THIS rank's manager only. _update_after_schedule
+                # is invoked once per (rank) SchedulerOutput, so each rank's
+                # manager is freed exactly once even for CP requests that
+                # appear on several ranks' outputs.
+                self._free_encoder_inputs(request, scheduler_output.cp_rank)
 
         # Clear the finished request IDs.
         # NOTE: We shouldn't do self.finished_req_ids.clear() here because
@@ -359,7 +391,8 @@ class CrossDPScheduler(Scheduler):
         self.waiting.has_slot_for_long_request = self.request_manager.has_slot_for_long_request()
 
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
-        self.encoder_cache_manager.free(request)
+        # Free encoder-cache references on every rank that hosts this request.
+        self._free_encoder_on_ranks(request, request.cp_ranks)
         request_id = request.request_id
         for cp_rank in request.cp_ranks:
             self.finished_req_ids[cp_rank].add(request_id)
@@ -783,8 +816,246 @@ class CrossDPScheduler(Scheduler):
         return engine_core_outputs
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
-        super()._preempt_request(request, timestamp)
+        """Preempt a request and put it back to the waiting queue.
+
+        NOTE: The request should be popped from the running queue outside of
+        this method. Unlike the base scheduler, encoder-cache references are
+        freed on EVERY rank currently hosting the request (its cp_ranks), not
+        on a single global manager, so each rank's local encoder-cache view
+        stays consistent.
+        """
+        assert request.status == RequestStatus.RUNNING, (
+            "Only running requests can be preempted"
+        )
+        self.kv_cache_manager.free(request)
+        self._free_encoder_on_ranks(request, request.cp_ranks)
+        request.status = RequestStatus.PREEMPTED
+        request.num_computed_tokens = 0
         request.kv_transfer_params = None
+        if request.spec_token_ids:
+            request.spec_token_ids = []
+        request.num_preemptions += 1
+        if self.log_stats:
+            request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
+        # Put the request back to the waiting queue.
+        self.waiting.prepend_request(request)
+
+    def _free_encoder_on_ranks(
+        self, request: Request, ranks: list[int] | tuple[int, ...]
+    ) -> None:
+        """Free all encoder-cache references held by *request* on *ranks*."""
+        for rank in ranks:
+            self.encoder_cache_managers[rank].free(request)
+
+    def _free_encoder_inputs(self, request: Request, cp_rank: int) -> None:
+        """Per-rank version of the base ``_free_encoder_inputs``.
+
+        Frees the request's reference to encoder inputs that have already been
+        consumed (their range is behind ``num_computed_tokens``) on the
+        *cp_rank*-th manager only. ``_update_after_schedule`` calls this once
+        per rank's SchedulerOutput, so each rank is freed exactly once.
+        """
+        mgr = self.encoder_cache_managers[cp_rank]
+        cached_encoder_input_ids = mgr.get_cached_input_ids(request)
+        if not cached_encoder_input_ids:
+            return
+        for input_id in list(cached_encoder_input_ids):
+            mm_feature = request.mm_features[input_id]
+            start_pos = mm_feature.mm_position.offset
+            num_tokens = mm_feature.mm_position.length
+            if self.is_encoder_decoder and request.num_computed_tokens > 0:
+                mgr.free_encoder_input(request, input_id)
+            elif start_pos + num_tokens <= request.num_computed_tokens:
+                mgr.free_encoder_input(request, input_id)
+
+    def reset_encoder_cache(self) -> None:
+        """Reset every per-rank encoder cache manager."""
+        for mgr in self.encoder_cache_managers:
+            mgr.reset()
+
+    def _get_encoder_cache_usage(self) -> float:
+        """Encoder cache usage averaged across ranks (for stats logging)."""
+        total_size = sum(mgr.cache_size for mgr in self.encoder_cache_managers)
+        if total_size == 0:
+            return 0.0
+        used_slots = sum(mgr.cache_size - mgr.num_free_slots
+                         for mgr in self.encoder_cache_managers)
+        return used_slots / total_size
+
+    def _cross_dp_try_schedule_encoder_inputs(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        num_new_tokens: int,
+        cp_ranks: list[int],
+        encoder_compute_budgets: list[int],
+    ) -> tuple[dict[int, list[int]], int, dict[int, list[int]], dict[int, int]]:
+        """Per-rank encoder-input planner (analogue of base
+        ``_try_schedule_encoder_inputs``).
+
+        For each multimodal input that overlaps the scheduled token range,
+        decide — INDEPENDENTLY PER RANK — whether that rank still needs to
+        compute/load it this step (i.e. the input is not already in that
+        rank's encoder cache and not already counted this step). Each rank's
+        worker has its own local ``encoder_cache`` and its own
+        ``encoder_cache_manager`` mirrors it, so the per-rank decision is
+        mandatory: an mm_hash can be cached on one rank (e.g. a DP request
+        computed it there) but absent on another (e.g. a CP request spanning
+        all ranks reuses the same image). A uniform decision would either
+        skip recomputation on the rank that lacks it (cache miss) or allocate
+        space on a rank that already has it (double-counted cache usage).
+
+        ``num_new_tokens`` is shared across cp_ranks (it is per-request), so
+        it is shrunk under a BINDING constraint: if ANY rank that still needs
+        an input cannot allocate space / afford the compute budget for it,
+        roll ``num_new_tokens`` back to just before that input.
+
+        The caller commits the per-rank cache allocation and compute-budget
+        debit only when the request is actually scheduled this step.
+
+        Args:
+            request: The request being scheduled.
+            num_computed_tokens: Computed-token offset (local + external).
+            num_new_tokens: Candidate tokens to schedule this step.
+            cp_ranks: Ranks that will host the request (known at call sites).
+            encoder_compute_budgets: Per-rank encoder compute budgets. Read
+                only here; the caller debits on success via ``consumed``.
+
+        Returns:
+            (to_schedule_by_rank, num_new_tokens, external_load_by_rank,
+            consumed_by_rank). Each dict is keyed by cp_rank; ``to_schedule``
+            feeds each rank's ``scheduled_encoder_inputs`` and ``consumed``
+            is debited from that rank's compute budget on success.
+        """
+        to_schedule: dict[int, list[int]] = {r: [] for r in cp_ranks}
+        external_load: dict[int, list[int]] = {r: [] for r in cp_ranks}
+        consumed: dict[int, int] = {r: 0 for r in cp_ranks}
+
+        if num_new_tokens == 0 or not request.has_encoder_inputs:
+            return to_schedule, num_new_tokens, external_load, consumed
+
+        mm_features = request.mm_features
+        assert mm_features is not None and len(mm_features) > 0
+
+        # Per-rank working state (committed by the caller on success).
+        scheduled_hashes: dict[int, set[str]] = {r: set() for r in cp_ranks}
+        embeds_scheduled: dict[int, int] = {r: 0 for r in cp_ranks}
+        budget_left: dict[int, int] = {r: encoder_compute_budgets[r] for r in cp_ranks}
+
+        shift = 1 if self.use_eagle else 0
+
+        for i, mm_feature in enumerate(mm_features):
+            start_pos = mm_feature.mm_position.offset
+            num_encoder_tokens = mm_feature.mm_position.length
+            num_encoder_embeds = mm_feature.mm_position.get_num_embeds()
+            item_identifier = mm_feature.identifier
+
+            if start_pos >= num_computed_tokens + num_new_tokens + shift:
+                # The encoder input is not needed in this step.
+                break
+
+            if self.is_encoder_decoder and num_computed_tokens > 0:
+                assert start_pos == 0, (
+                    "Encoder input should be processed at the beginning of "
+                    "the sequence when encoder-decoder models are used."
+                )
+                continue
+            elif start_pos + num_encoder_tokens <= num_computed_tokens:
+                # Already computed and stored in the decoder's KV cache.
+                continue
+
+            # Per-rank: does this rank still need to compute/load input i?
+            # An input already counted on r this step, or already present in
+            # r's cache, is not (re)computed on r.
+            needs_on_rank: dict[int, bool] = {}
+            for r in cp_ranks:
+                if not self.is_encoder_decoder:
+                    if item_identifier in scheduled_hashes[r]:
+                        needs_on_rank[r] = False
+                        continue
+                    if self.encoder_cache_managers[r].check_and_update_cache(
+                        request, i
+                    ):
+                        needs_on_rank[r] = False
+                        continue
+                needs_on_rank[r] = True
+
+            if not any(needs_on_rank.values()):
+                # Every host already has this input cached/counted.
+                continue
+
+            # If chunking of an mm input is disabled, do not partially cover
+            # it: roll back to just before the mm item.
+            if (
+                self.scheduler_config.disable_chunked_mm_input
+                and num_computed_tokens < start_pos
+                and (num_computed_tokens + num_new_tokens)
+                < (start_pos + num_encoder_tokens)
+            ):
+                num_new_tokens = max(
+                    0, start_pos - (num_computed_tokens + shift)
+                )
+                break
+
+            # Binding constraint: every rank that still needs this input must
+            # be able to allocate cache space and afford the compute budget.
+            # can_allocate may evict freeable entries on a rank that succeeds;
+            # evicted entries are unreferenced (safe) and are reported back to
+            # that rank's worker via free_encoder_mm_hashes.
+            rolled_back = False
+            for r in cp_ranks:
+                if not needs_on_rank[r]:
+                    continue
+                if not self.encoder_cache_managers[r].can_allocate(
+                    request, i, budget_left[r], embeds_scheduled[r]
+                ):
+                    if num_computed_tokens + shift < start_pos:
+                        num_new_tokens = start_pos - (
+                            num_computed_tokens + shift
+                        )
+                    else:
+                        num_new_tokens = 0
+                    rolled_back = True
+                    break
+            if rolled_back:
+                break
+
+            # Embeddings actually within the scheduled range.
+            start_idx_rel = max(0, num_computed_tokens - start_pos)
+            end_idx_rel = min(
+                num_encoder_tokens,
+                num_computed_tokens + num_new_tokens - start_pos,
+            )
+            curr_embeds_start, curr_embeds_end = (
+                mm_feature.mm_position.get_embeds_indices_in_range(
+                    start_idx_rel, end_idx_rel
+                )
+            )
+            if curr_embeds_end - curr_embeds_start == 0:
+                continue
+
+            is_external = (
+                self.ec_connector is not None
+                and self.ec_connector.has_cache_item(item_identifier)
+            )
+
+            # Commit per rank: only ranks that still need this input.
+            for r in cp_ranks:
+                if not needs_on_rank[r]:
+                    continue
+                if item_identifier in scheduled_hashes[r]:
+                    continue
+                scheduled_hashes[r].add(item_identifier)
+                embeds_scheduled[r] += num_encoder_embeds
+                if is_external:
+                    external_load[r].append(i)
+                else:
+                    to_schedule[r].append(i)
+                    budget_left[r] -= num_encoder_embeds
+                    consumed[r] += num_encoder_embeds
+
+        return to_schedule, num_new_tokens, external_load, consumed
+
 
     def schedule(self) -> list[SchedulerOutput]:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -841,9 +1112,15 @@ class CrossDPScheduler(Scheduler):
             for r in cp_ranks:
                 rank_budgets[r] -= per_rank_cost
 
-        # # Encoder-related.
-        scheduled_encoder_inputs: dict[str, list[int]] = {}
-        encoder_compute_budget = self.max_num_encoder_input_tokens
+        # # Encoder-related (per-rank: one dict / budget per cp_rank).
+        # Each rank's worker has its own encoder cache, so the set of inputs
+        # to compute and the compute budget are tracked independently per rank.
+        scheduled_encoder_inputs: list[dict[str, list[int]]] = [
+            {} for _ in range(self.cp_world_size)
+        ]
+        encoder_compute_budgets: list[int] = [
+            self.max_num_encoder_input_tokens for _ in range(self.cp_world_size)
+        ]
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
 
@@ -897,26 +1174,26 @@ class CrossDPScheduler(Scheduler):
                 num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens
             )
 
-            # Schedule encoder inputs (mirrors the base scheduler so the model
-            # runner is told which multimodal items to compute/load this step).
-            # Without this, encoder_cache stays empty on this rank and a
-            # (re-)prefill of a multimodal request hits an encoder cache miss
-            # in _gather_mm_embeddings.
-            encoder_inputs_to_schedule: list[int] | None = None
-            external_load_encoder_input: list[int] = []
-            new_encoder_compute_budget = encoder_compute_budget
-            if request.has_encoder_inputs:
+            # Schedule encoder inputs per-rank. The request is RUNNING, so its
+            # cp_ranks are already known. The decision mutates the managers on
+            # every hosting rank (check + can_allocate) and may shrink
+            # num_new_tokens; allocation is finalized below once KV slots are
+            # secured. The returned per-rank dicts are keyed by cp_rank.
+            enc_to_schedule_by_rank: dict[int, list[int]] = {}
+            enc_external_by_rank: dict[int, list[int]] = {}
+            enc_consumed_by_rank: dict[int, int] = {}
+            if request.has_encoder_inputs and request.cp_ranks:
                 (
-                    encoder_inputs_to_schedule,
+                    enc_to_schedule_by_rank,
                     num_new_tokens,
-                    new_encoder_compute_budget,
-                    external_load_encoder_input,
-                ) = self._try_schedule_encoder_inputs(
+                    enc_external_by_rank,
+                    enc_consumed_by_rank,
+                ) = self._cross_dp_try_schedule_encoder_inputs(
                     request,
                     request.num_computed_tokens,
                     num_new_tokens,
-                    encoder_compute_budget,
-                    shift_computed_tokens=1 if self.use_eagle else 0,
+                    request.cp_ranks,
+                    encoder_compute_budgets,
                 )
 
             # [vllm add]
@@ -986,19 +1263,26 @@ class CrossDPScheduler(Scheduler):
                                 r in request.cp_ranks for r in candidate.cp_ranks
                             ):
                                 preempted_req = self.running.pop(i)
-                                # Restore the encoder compute budget if the
-                                # preempted request had encoder inputs
-                                # scheduled earlier in this step.
-                                if preempted_req.request_id in scheduled_encoder_inputs:
-                                    preempted_encoder_inputs = (
-                                        scheduled_encoder_inputs.pop(
-                                            preempted_req.request_id
+                                # Restore per-rank encoder compute budgets if
+                                # the preempted request had encoder inputs
+                                # scheduled earlier in this step. preempted_req
+                                # still carries its cp_ranks here (they are
+                                # cleared further below after _preempt_request).
+                                for pr_rank in preempted_req.cp_ranks:
+                                    if preempted_req.request_id in (
+                                        scheduled_encoder_inputs[pr_rank]
+                                    ):
+                                        preempted_encoder_inputs = (
+                                            scheduled_encoder_inputs[
+                                                pr_rank
+                                            ].pop(preempted_req.request_id)
                                         )
-                                    )
-                                    encoder_compute_budget += sum(
-                                        preempted_req.get_num_encoder_embeds(i)
-                                        for i in preempted_encoder_inputs
-                                    )
+                                        encoder_compute_budgets[pr_rank] += sum(
+                                            preempted_req.get_num_encoder_embeds(
+                                                ei
+                                            )
+                                            for ei in preempted_encoder_inputs
+                                        )
                                 break
 
                         if preempted_req is None:
@@ -1025,21 +1309,31 @@ class CrossDPScheduler(Scheduler):
                 break
 
             assert len(request.cp_ranks) == len(new_blocks)
-            # Encoder-related: finalize encoder input scheduling.
-            if encoder_inputs_to_schedule:
-                scheduled_encoder_inputs[request.request_id] = (
-                    encoder_inputs_to_schedule
-                )
-                for i in encoder_inputs_to_schedule:
-                    self.encoder_cache_manager.allocate(request, i)
-                    if self.ec_connector is not None:
-                        self.ec_connector.update_state_after_alloc(request, i)
-                encoder_compute_budget = new_encoder_compute_budget
-            if external_load_encoder_input:
-                for i in external_load_encoder_input:
-                    self.encoder_cache_manager.allocate(request, i)
-                    if self.ec_connector is not None:
-                        self.ec_connector.update_state_after_alloc(request, i)
+            # Encoder-related: finalize encoder input scheduling. Each rank's
+            # worker computes only the inputs that THIS rank still needs into
+            # its own local encoder_cache, so commit per rank — a rank that
+            # already had an input cached (e.g. shared image from a prior DP
+            # request) does not re-allocate it.
+            for rank in request.cp_ranks:
+                rank_inputs = enc_to_schedule_by_rank.get(rank, [])
+                if rank_inputs:
+                    scheduled_encoder_inputs[rank][request.request_id] = rank_inputs
+                    for ei in rank_inputs:
+                        self.encoder_cache_managers[rank].allocate(request, ei)
+                for ei in enc_external_by_rank.get(rank, []):
+                    self.encoder_cache_managers[rank].allocate(request, ei)
+                # Commit the per-rank encoder compute budget debit now that
+                # the request is actually scheduled this step.
+                encoder_compute_budgets[rank] -= enc_consumed_by_rank.get(rank, 0)
+            # EC update is keyed by mm_hash (global), so call once per distinct
+            # external input (deduped across ranks).
+            if self.ec_connector is not None:
+                seen_external: set[int] = set()
+                for rank in request.cp_ranks:
+                    for ei in enc_external_by_rank.get(rank, []):
+                        if ei not in seen_external:
+                            seen_external.add(ei)
+                            self.ec_connector.update_state_after_alloc(request, ei)
             # Schedule the request.
             for i, rank in enumerate(request.cp_ranks):
                 scheduled_running_reqs[rank].append(request)
@@ -1151,13 +1445,6 @@ class CrossDPScheduler(Scheduler):
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
 
-                # Encoder-related trackers, filled in by
-                # _try_schedule_encoder_inputs when the request has multimodal
-                # inputs that overlap the scheduled range.
-                encoder_inputs_to_schedule: list[int] | None = None
-                external_load_encoder_input: list[int] = []
-                new_encoder_compute_budget = encoder_compute_budget
-
                 if load_kv_async:
                     # KVTransfer: loading remote KV, do not allocate for new work.
                     assert num_external_computed_tokens > 0
@@ -1203,29 +1490,6 @@ class CrossDPScheduler(Scheduler):
 
                     num_new_tokens = min(num_new_tokens, effective_budget)
                     assert num_new_tokens > 0
-
-                    # Schedule encoder inputs. This may shrink num_new_tokens
-                    # (e.g. roll back to just before an encoder input that
-                    # cannot be computed/loaded this step), and records which
-                    # multimodal items the model runner must compute/load.
-                    if request.has_encoder_inputs:
-                        (
-                            encoder_inputs_to_schedule,
-                            num_new_tokens,
-                            new_encoder_compute_budget,
-                            external_load_encoder_input,
-                        ) = self._try_schedule_encoder_inputs(
-                            request,
-                            num_computed_tokens,
-                            num_new_tokens,
-                            encoder_compute_budget,
-                            shift_computed_tokens=1 if self.use_eagle else 0,
-                        )
-                        if num_new_tokens == 0:
-                            # An encoder input overlaps the scheduled range but
-                            # cannot be scheduled this step (encoder budget or
-                            # cache exhausted). Stop scheduling waiting reqs.
-                            break
 
                     # Determine the request type for batch homogeneity check.
                     # For waiting requests, use num_computed_tokens (which may
@@ -1284,11 +1548,10 @@ class CrossDPScheduler(Scheduler):
                 )
                 if selected_dp is None:
                     # Cannot place this request on any rank right now.
-                    # Skip it and try smaller requests behind it.
-                    # Undo any encoder-cache references touched while trying,
-                    # since the request will not run this step.
-                    if request.has_encoder_inputs:
-                        self.encoder_cache_manager.free(request)
+                    # Skip it and try smaller requests behind it. No encoder
+                    # managers have been touched yet (the per-rank encoder
+                    # decision happens after placement is known), so there is
+                    # nothing to undo.
                     self.waiting.pop_request()
                     skipped_waiting_requests.prepend_request(request)
                     continue
@@ -1297,6 +1560,39 @@ class CrossDPScheduler(Scheduler):
                     logger.info(f"It's a cp req, selected_dp: {selected_dp}, request id: {request.request_id}, specify_dp: {specify_dp}, num_new_tokens: {num_new_tokens} rank_budgets: {rank_budgets}, num_req_per_dp: {self.request_manager.num_req_per_dp}")
                 else:
                     logger.info(f"It's a short req, selected_dp: {selected_dp}, request id: {request.request_id}, specify_dp: {specify_dp}, num_new_tokens: {num_new_tokens}, rank_budgets: {rank_budgets}, num_req_per_dp: {self.request_manager.num_req_per_dp}")
+
+                # Per-rank encoder decision. Now that selected_dp is known we
+                # can consult the correct per-rank managers. This may shrink
+                # num_new_tokens (e.g. roll back to just before an encoder
+                # input that cannot be computed/loaded this step). Skipped for
+                # async KV loads (num_new_tokens == 0 there). The returned
+                # per-rank dicts are keyed by cp_rank.
+                enc_to_schedule_by_rank: dict[int, list[int]] = {}
+                enc_external_by_rank: dict[int, list[int]] = {}
+                enc_consumed_by_rank: dict[int, int] = {}
+                if not load_kv_async and request.has_encoder_inputs:
+                    (
+                        enc_to_schedule_by_rank,
+                        num_new_tokens,
+                        enc_external_by_rank,
+                        enc_consumed_by_rank,
+                    ) = self._cross_dp_try_schedule_encoder_inputs(
+                        request,
+                        num_computed_tokens,
+                        num_new_tokens,
+                        selected_dp,
+                        encoder_compute_budgets,
+                    )
+                    if num_new_tokens == 0:
+                        # An encoder input overlaps the scheduled range but
+                        # cannot be scheduled this step (encoder budget or
+                        # cache exhausted on the selected rank(s)). Undo the
+                        # manager references touched while trying and defer
+                        # the request to a future step.
+                        self._free_encoder_on_ranks(request, selected_dp)
+                        self.waiting.pop_request()
+                        skipped_waiting_requests.prepend_request(request)
+                        continue
 
                 # [vllm add]
                 new_blocks = self.kv_cache_manager.allocate_slots(
@@ -1311,11 +1607,11 @@ class CrossDPScheduler(Scheduler):
                     num_encoder_tokens=num_encoder_tokens,
                 )
                 if new_blocks is None:
-                    # The request cannot be scheduled.
-                    # NOTE: untouch the encoder cache manager, which may have
-                    # been updated while scheduling encoder inputs above.
-                    if request.has_encoder_inputs:
-                        self.encoder_cache_manager.free(request)
+                    # The request cannot be scheduled. Undo the per-rank
+                    # encoder-cache references touched while planning, since
+                    # the request will not run this step.
+                    if not load_kv_async and request.has_encoder_inputs:
+                        self._free_encoder_on_ranks(request, selected_dp)
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -1404,21 +1700,30 @@ class CrossDPScheduler(Scheduler):
                 request.prev_cp_ranks = []
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
-                # Encoder-related: finalize encoder input scheduling.
-                if encoder_inputs_to_schedule:
-                    scheduled_encoder_inputs[request.request_id] = (
-                        encoder_inputs_to_schedule
-                    )
-                    for i in encoder_inputs_to_schedule:
-                        self.encoder_cache_manager.allocate(request, i)
-                        if self.ec_connector is not None:
-                            self.ec_connector.update_state_after_alloc(request, i)
-                    encoder_compute_budget = new_encoder_compute_budget
-                if external_load_encoder_input:
-                    for i in external_load_encoder_input:
-                        self.encoder_cache_manager.allocate(request, i)
-                        if self.ec_connector is not None:
-                            self.ec_connector.update_state_after_alloc(request, i)
+                # Encoder-related: finalize encoder input scheduling. Each rank
+                # (selected_dp == request.cp_ranks) computes only the inputs
+                # that THIS rank still needs, so commit per rank — a rank that
+                # already had an input cached does not re-allocate it.
+                for rank in request.cp_ranks:
+                    rank_inputs = enc_to_schedule_by_rank.get(rank, [])
+                    if rank_inputs:
+                        scheduled_encoder_inputs[rank][request.request_id] = (
+                            rank_inputs
+                        )
+                        for ei in rank_inputs:
+                            self.encoder_cache_managers[rank].allocate(request, ei)
+                    for ei in enc_external_by_rank.get(rank, []):
+                        self.encoder_cache_managers[rank].allocate(request, ei)
+                    encoder_compute_budgets[rank] -= enc_consumed_by_rank.get(rank, 0)
+                # EC update is keyed by mm_hash (global), so call once per
+                # distinct external input (deduped across ranks).
+                if self.ec_connector is not None:
+                    seen_external: set[int] = set()
+                    for rank in request.cp_ranks:
+                        for ei in enc_external_by_rank.get(rank, []):
+                            if ei not in seen_external:
+                                seen_external.add(ei)
+                                self.ec_connector.update_state_after_alloc(request, ei)
                 # Count the number of prefix cached tokens.
                 if request.num_cached_tokens < 0:
                     request.num_cached_tokens = num_computed_tokens
@@ -1494,11 +1799,18 @@ class CrossDPScheduler(Scheduler):
 
         none_tokens_in_peer_sched = all([sum(num_scheduled_tokens[idx].values()) == 0 for idx in range(self.cp_world_size)])
 
-        # Capture encoder-cache evictions ONCE: get_freed_mm_hashes() clears the
-        # internal list on each call, so calling it inside the per-rank loop
-        # below would only notify the first non-empty rank and leave the others
-        # with stale encoder_cache entries.
-        freed_encoder_mm_hashes = self.encoder_cache_manager.get_freed_mm_hashes()
+        # Capture encoder-cache evictions PER RANK. Each rank's manager tracks
+        # its own evictions (a rank that ran out of space evicts entries that
+        # other ranks may still hold), and get_freed_mm_hashes() clears the
+        # internal list on each call, so drain each manager exactly once and
+        # route its freed list back to that rank's SchedulerOutput. Also set
+        # per-rank scheduled_encoder_inputs on the empty-output path so a rank
+        # that schedules no tokens this step still receives its eviction
+        # notifications and an (empty) rank-local encoder-input map.
+        freed_encoder_mm_hashes_per_rank = [
+            self.encoder_cache_managers[idx].get_freed_mm_hashes()
+            for idx in range(self.cp_world_size)
+        ]
 
         for idx in range(self.cp_world_size):
             new_block_ids_to_zero = (
@@ -1513,6 +1825,9 @@ class CrossDPScheduler(Scheduler):
                 scheduler_output.req_id_to_cp_size = req_id_to_cp_size
                 scheduler_output.cp_rank_to_req_id = cp_rank_to_req_id[idx]    # revised
                 scheduler_output.new_block_ids_to_zero = new_block_ids_to_zero
+                # Per-rank encoder fields (rank-local; empty for this rank).
+                scheduler_output.scheduled_encoder_inputs = scheduled_encoder_inputs[idx]
+                scheduler_output.free_encoder_mm_hashes = freed_encoder_mm_hashes_per_rank[idx]
                 total_scheduler_output.append(scheduler_output)
             else:
                 total_scheduler_output.append(
@@ -1522,7 +1837,9 @@ class CrossDPScheduler(Scheduler):
                         num_scheduled_tokens=num_scheduled_tokens[idx], # num_scheduled_tokens should be refined
                         total_num_scheduled_tokens=sum(num_scheduled_tokens[idx].values()), # num_scheduled_tokens should be refined
                         scheduled_spec_decode_tokens=scheduled_spec_decode_tokens, # num_scheduled_tokens should be refined
-                        scheduled_encoder_inputs=scheduled_encoder_inputs, # num_scheduled_tokens should be refined
+                        # Rank-local: only the inputs owned by THIS rank, so the
+                        # worker's rank-scoped self.requests has every req_id.
+                        scheduled_encoder_inputs=scheduled_encoder_inputs[idx],
                         num_common_prefix_blocks=num_common_prefix_blocks, # num_scheduled_tokens should be refined
                         preempted_req_ids={req.request_id for req in preempted_reqs[idx]},
                         # finished_req_ids is an existing state in the scheduler,
@@ -1530,7 +1847,7 @@ class CrossDPScheduler(Scheduler):
                         # It contains the request IDs that are finished in between
                         # the previous and the current steps.
                         finished_req_ids=self.finished_req_ids[idx],
-                        free_encoder_mm_hashes=freed_encoder_mm_hashes,
+                        free_encoder_mm_hashes=freed_encoder_mm_hashes_per_rank[idx],
                         new_block_ids_to_zero=new_block_ids_to_zero,
                         cp_rank=idx,
                         cp_rank_scheduled_tokens=cp_rank_scheduled_tokens[idx],
@@ -1554,17 +1871,22 @@ class CrossDPScheduler(Scheduler):
                 scheduler_output.kv_connector_metadata = meta
             self.connector.clear_reqs_need_recv() # debug
 
-        # EC connector: build the encoder-cache transfer metadata once per step
-        # and attach it to the rank-0 output (the rank that runs the multimodal
-        # encoder). Without this, the mm_hashes registered via
-        # update_state_after_alloc are never consumed, so the consumer side
-        # never loads the encoder caches.
+        # EC connector: build the encoder-cache transfer metadata once per
+        # step. build_connector_meta() drains the global _mm_datas_need_loads
+        # map (populated by update_state_after_alloc above) and clears it, so
+        # it can only be called once. Every is_first_rank worker invokes
+        # maybe_get_ec_connector_output -> _get_ec_connector_output, which
+        # asserts ec_connector_metadata is not None, so the built metadata must
+        # be attached to EVERY rank's output (not just rank 0). The metadata is
+        # consumed read-only by each worker's start_load_caches.
         if self.ec_connector is not None and total_scheduler_output:
-            total_scheduler_output[0].ec_connector_metadata = (
-                self.ec_connector.build_connector_meta(
-                    total_scheduler_output[0]
-                )
+            ec_meta = self.ec_connector.build_connector_meta(
+                total_scheduler_output[0]
             )
+            for scheduler_output in total_scheduler_output:
+                if scheduler_output is None:
+                    continue
+                scheduler_output.ec_connector_metadata = ec_meta
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             # self._update_after_schedule(scheduler_output)
