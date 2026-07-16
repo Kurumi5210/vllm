@@ -10,6 +10,7 @@ import asyncio
 from unittest.mock import patch
 
 import pytest
+import torch
 
 from vllm.config import set_current_vllm_config
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import (
@@ -20,6 +21,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     MooncakeXferMetadata,
     SendBlockMeta,
     TransferRegion,
+)
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    MLAAttentionSpec,
+    SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
 )
 
 from .test_mooncake_connector import FakeMooncakeWrapper, patch_worker_dependencies
@@ -157,6 +165,122 @@ def test_get_sw_clipped_blocks_noop_no_hma():
     assert clipped == [[1, 2, 3]]
 
 
+@pytest.mark.cpu_test
+def test_get_transfer_block_ids_clips_compressed_and_swa_groups():
+    """Transfer block IDs use compressed token space and SWA tail windows."""
+    block_size = 32
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_both",
+        block_size=block_size,
+    )
+    vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = False
+    kv_cache_config = KVCacheConfig(
+        num_blocks=100,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["model.layers.0.self_attn.attn"],
+                MLAAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    compress_ratio=4,
+                    model_version="deepseek_v4",
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["model.layers.0.self_attn.swa_cache"],
+                SlidingWindowSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=128,
+                ),
+            ),
+        ],
+    )
+
+    scheduler = MooncakeConnectorScheduler(
+        vllm_config=vllm_config,
+        engine_id="test-engine",
+        kv_cache_config=kv_cache_config,
+    )
+    assert scheduler.blocks_per_sw == [0, 5]
+    assert scheduler.group_compress_ratios == [4, 1]
+
+    compressed_blocks = list(range(1, 34))
+    swa_blocks = list(range(100, 133))
+    selected = scheduler.get_transfer_block_ids(
+        (compressed_blocks, swa_blocks),
+        num_total_tokens=1034,
+    )
+
+    # floor(1034 / 4) compressed tokens at block_size=32 -> 9 blocks.
+    assert selected[0] == compressed_blocks[:9]
+    # SWA keeps the last cdiv(128, 32) + 1 = 5 blocks.
+    assert selected[1] == swa_blocks[-5:]
+
+
+@pytest.mark.cpu_test
+def test_get_transfer_block_ids_uses_candidate_bounds_for_mixed_compress_group():
+    block_size = 128
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_both",
+        block_size=block_size,
+    )
+    c4_spec = MLAAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        compress_ratio=4,
+        model_version="deepseek_v4",
+    )
+    c128_spec = MLAAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        compress_ratio=128,
+        model_version="deepseek_v4",
+    )
+    mixed_spec = UniformTypeKVCacheSpecs.from_specs(
+        {
+            "model.layers.0.self_attn.attn": c4_spec,
+            "model.layers.1.self_attn.attn": c128_spec,
+        }
+    )
+    assert mixed_spec is not None
+    kv_cache_config = KVCacheConfig(
+        num_blocks=100,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(list(mixed_spec.kv_cache_specs), mixed_spec),
+        ],
+    )
+
+    scheduler = MooncakeConnectorScheduler(
+        vllm_config=vllm_config,
+        engine_id="test-engine",
+        kv_cache_config=kv_cache_config,
+    )
+    assert scheduler.group_compress_ratios == [4]
+
+    block_ids = list(range(100, 120))
+    selected = scheduler.get_transfer_block_ids(
+        (block_ids,),
+        num_total_tokens=8192,
+    )
+
+    # The scheduler keeps enough candidates for the C4 layers in the mixed
+    # group; worker-side region planning will trim C128 regions further.
+    assert selected[0] == block_ids[:16]
+
+
 # ---------------------------------------------------------------------------
 #  test_metadata_hma_block_ids: MooncakeConnectorMetadata stores per-group IDs
 # ---------------------------------------------------------------------------
@@ -289,6 +413,150 @@ async def test_build_transfer_params_multi_group_trimming(monkeypatch):
         assert len(src_ptrs) > 0
         assert len(dst_ptrs) == len(src_ptrs)
         assert len(lengths) == len(src_ptrs)
+
+        worker.shutdown()
+
+
+@pytest.mark.asyncio
+@patch(
+    "vllm.distributed.kv_transfer.kv_connector.v1.mooncake"
+    ".mooncake_connector.TransferEngine",
+    FakeMooncakeWrapper,
+)
+async def test_build_transfer_params_trims_mixed_compress_group_per_region(
+    monkeypatch,
+):
+    monkeypatch.setenv("VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT", "5")
+    block_size = 128
+    num_tokens = 8192
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_producer",
+        block_size=block_size,
+    )
+    c4_layer = "model.layers.0.self_attn.attn"
+    c128_layer = "model.layers.1.self_attn.attn"
+    c4_spec = MLAAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        compress_ratio=4,
+        model_version="deepseek_v4",
+    )
+    c128_spec = MLAAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        compress_ratio=128,
+        model_version="deepseek_v4",
+    )
+    mixed_spec = UniformTypeKVCacheSpecs.from_specs(
+        {
+            c4_layer: c4_spec,
+            c128_layer: c128_spec,
+        }
+    )
+    assert mixed_spec is not None
+    kv_cache_config = KVCacheConfig(
+        num_blocks=100,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec([c4_layer, c128_layer], mixed_spec)],
+    )
+
+    with set_current_vllm_config(vllm_config), patch_worker_dependencies():
+        connector = MooncakeConnector(
+            vllm_config, KVConnectorRole.WORKER, kv_cache_config
+        )
+        worker = connector.connector_worker
+        assert worker is not None
+
+        transfer_id = "xfer-mixed-compress"
+        block_len = 64
+        local_blocks = list(range(100, 116))
+        remote_blocks = list(range(200, 216))
+        send_meta = SendBlockMeta(
+            p_req_id="p-mixed",
+            transfer_id=transfer_id,
+            local_block_ids=[local_blocks],
+            ready=asyncio.Event(),
+        )
+        xfer_meta = MooncakeXferMetadata(
+            remote_hostname="consumer-host",
+            remote_port=54321,
+            remote_tp_size=1,
+            remote_tp_rank=0,
+            req_blocks={"d-mixed": (transfer_id, [remote_blocks])},
+            req_token_ranges={"d-mixed": (num_tokens, 0)},
+            kv_caches_base_addr=[0x3000, 0x4000],
+            block_lens=[block_len, block_len],
+            kv_block_lens=[block_len, block_len],
+            registered_layer_names=[c4_layer, c128_layer],
+            registered_layer_indices=[0, 1],
+            registered_group_indices=[0, 0],
+        )
+        local_regions = [
+            TransferRegion(
+                layer_name=c4_layer,
+                layer_index=0,
+                base_addr=0x1000,
+                block_len=block_len,
+                kv_block_len=block_len,
+                group_index=0,
+            ),
+            TransferRegion(
+                layer_name=c128_layer,
+                layer_index=1,
+                base_addr=0x2000,
+                block_len=block_len,
+                kv_block_len=block_len,
+                group_index=0,
+            ),
+        ]
+        remote_regions = [
+            TransferRegion(
+                layer_name=c4_layer,
+                layer_index=0,
+                base_addr=0x3000,
+                block_len=block_len,
+                kv_block_len=block_len,
+                group_index=0,
+            ),
+            TransferRegion(
+                layer_name=c128_layer,
+                layer_index=1,
+                base_addr=0x4000,
+                block_len=block_len,
+                kv_block_len=block_len,
+                group_index=0,
+            ),
+        ]
+
+        (
+            src_ptrs,
+            dst_ptrs,
+            lengths,
+            err_reqs,
+            err_msg,
+        ) = await worker._build_transfer_params(
+            [("d-mixed", send_meta)],
+            xfer_meta,
+            local_regions,
+            remote_regions,
+        )
+
+        assert err_reqs == []
+        assert err_msg is None
+        assert src_ptrs == [
+            0x1000 + local_blocks[0] * block_len,
+            0x2000 + local_blocks[0] * block_len,
+        ]
+        assert dst_ptrs == [
+            0x3000 + remote_blocks[0] * block_len,
+            0x4000 + remote_blocks[0] * block_len,
+        ]
+        assert lengths == [16 * block_len, block_len]
 
         worker.shutdown()
 

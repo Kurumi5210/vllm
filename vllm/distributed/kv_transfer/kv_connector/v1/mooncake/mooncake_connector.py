@@ -8,7 +8,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 import httpx
 import msgspec
@@ -659,16 +659,29 @@ def _select_region_block_ids(
     local_block_ids_per_group: list[list[int]],
     remote_block_ids_per_group: list[list[int]],
     group_indices: tuple[int, ...],
+    group_block_slicer: Callable[
+        [int, list[int], list[int]], tuple[list[int], list[int]]
+    ]
+    | None = None,
 ) -> tuple[list[int], list[int], str | None]:
     local_block_ids: list[int] = []
     remote_block_ids: list[int] = []
+    allow_remote_only_skip = len(group_indices) > 1
 
     for group_idx in group_indices:
         local_group = local_block_ids_per_group[group_idx]
         remote_group = remote_block_ids_per_group[group_idx]
+        if group_block_slicer is not None:
+            local_group, remote_group = group_block_slicer(
+                group_idx,
+                list(local_group),
+                list(remote_group),
+            )
         n_local = len(local_group)
         n_remote = len(remote_group)
         if n_remote == 0:
+            continue
+        if n_local == 0 and allow_remote_only_skip:
             continue
         if n_local < n_remote:
             return [], [], "P num blocks less than D"
@@ -699,6 +712,9 @@ class MooncakeXferMetadata(
     kv_caches_base_addr: list[int]
     block_lens: list[int]
     kv_block_lens: list[int]
+    req_token_ranges: dict[ReqId, tuple[int, int]] = msgspec.field(
+        default_factory=dict
+    )
     registered_layer_names: list[str] = msgspec.field(default_factory=list)
     registered_layer_indices: list[int] = msgspec.field(default_factory=list)
     registered_group_indices: list[int] = msgspec.field(default_factory=list)
@@ -740,6 +756,8 @@ class PullReqMeta:
     local_block_ids: list[list[int]]
     remote_engine_id: EngineId
     remote_bootstrap_addr: str
+    num_total_tokens: int = 0
+    num_computed_tokens: int = 0
     # Set expire time to avoid infinitely sending requests.
     expire_time: float = float("inf")
     # Designed for one D pairing to multiple P
@@ -772,6 +790,8 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         local_block_ids: list[list[int]],
         kv_transfer_params: dict[str, Any],
         load_remote_cache: bool = True,
+        num_total_tokens: int = 0,
+        num_computed_tokens: int = 0,
     ):
         transfer_id = kv_transfer_params["transfer_id"]
         if load_remote_cache:
@@ -782,6 +802,8 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                 remote_engine_id=remote_engine_id,
                 remote_bootstrap_addr=kv_transfer_params["remote_bootstrap_addr"],
                 transfer_id=transfer_id,
+                num_total_tokens=num_total_tokens,
+                num_computed_tokens=num_computed_tokens,
             )
         else:
             self.reqs_to_send[request_id] = (transfer_id, local_block_ids)
@@ -966,25 +988,60 @@ class MooncakeConnectorScheduler:
         # Requests that need to start recv/send.
         # New requests are added by update_state_after_alloc in
         # the scheduler. Used to make metadata passed to Worker.
-        self._reqs_need_recv: dict[ReqId, tuple[Request, list[list[int]]]] = {}
+        self._reqs_need_recv: dict[
+            ReqId, tuple[Request, list[list[int]], int, int]
+        ] = {}
         self._reqs_need_send: dict[ReqId, tuple[Request, list[list[int]]]] = {}
         # Reqs to remove from processed set because they're not to send after
         # remote prefill or aborted.
         self._reqs_not_processed: set[TransferId] = set()
 
-        # Compute sliding window block counts per KV cache group.
-        sw_sizes_tokens: list[tuple[int, int]] = [
-            (g.kv_cache_spec.sliding_window, g.kv_cache_spec.block_size)
-            if isinstance(g.kv_cache_spec, SlidingWindowSpec)
-            else (0, self.block_size)
-            for g in kv_cache_config.kv_cache_groups
+        self.blocks_per_sw = [
+            self._get_group_blocks_per_sw(group)
+            for group in kv_cache_config.kv_cache_groups
         ]
+        self.group_block_sizes = [
+            group.kv_cache_spec.block_size for group in kv_cache_config.kv_cache_groups
+        ]
+        self.group_compress_ratios = [
+            self._get_group_compress_ratio(group)
+            for group in kv_cache_config.kv_cache_groups
+        ]
+
+    @staticmethod
+    def _get_unique_group_specs(group: Any) -> list[KVCacheSpec]:
+        kv_cache_spec = group.kv_cache_spec
+        kv_cache_specs = getattr(kv_cache_spec, "kv_cache_specs", None)
+        if not isinstance(kv_cache_specs, dict):
+            return [kv_cache_spec]
+
+        specs: list[KVCacheSpec] = []
+        for layer_name in group.layer_names:
+            spec = kv_cache_specs[layer_name]
+            if spec not in specs:
+                specs.append(spec)
+        return specs
+
+    @staticmethod
+    def _get_group_compress_ratio(group: Any) -> int:
+        compress_ratios = [
+            max(int(getattr(spec, "compress_ratio", 1) or 1), 1)
+            for spec in MooncakeConnectorScheduler._get_unique_group_specs(group)
+        ]
+        return min(compress_ratios) if compress_ratios else 1
+
+    @staticmethod
+    def _get_group_blocks_per_sw(group: Any) -> int:
         # cdiv(n_tokens, block_size) gives blocks/window; add 1 to
         # conservatively account for boundary overlap.
-        self.blocks_per_sw = [
-            cdiv(n_tokens, block_size) + 1 if n_tokens else 0
-            for n_tokens, block_size in sw_sizes_tokens
-        ]
+        return max(
+            (
+                cdiv(sliding_window, spec.block_size) + 1
+                for spec in MooncakeConnectorScheduler._get_unique_group_specs(group)
+                if (sliding_window := getattr(spec, "sliding_window", None))
+            ),
+            default=0,
+        )
 
     def get_sw_clipped_blocks(
         self,
@@ -997,6 +1054,33 @@ class MooncakeConnectorScheduler:
             blocks[-self.blocks_per_sw[i] :] if self.blocks_per_sw[i] > 0 else blocks
             for i, blocks in enumerate(block_ids)
         ]
+
+    def get_transfer_block_ids(
+        self,
+        block_ids: tuple[list[int], ...] | list[list[int]],
+        num_total_tokens: int,
+        num_computed_tokens: int = 0,
+    ) -> list[list[int]]:
+        """Select the blocks that actually contain transferable KV cache."""
+        if len(block_ids) == 0:
+            return list(block_ids)
+
+        selected_block_ids: list[list[int]] = []
+        for i, blocks in enumerate(block_ids):
+            blocks = list(blocks)
+            if self._is_hma_required and self.blocks_per_sw[i] > 0:
+                selected_block_ids.append(blocks[-self.blocks_per_sw[i] :])
+                continue
+
+            compress_ratio = self.group_compress_ratios[i]
+            if compress_ratio > 1:
+                group_total_tokens = num_total_tokens // compress_ratio
+                group_computed_tokens = num_computed_tokens // compress_ratio
+                group_new_tokens = max(group_total_tokens - group_computed_tokens, 0)
+                group_blocks = cdiv(group_new_tokens, self.group_block_sizes[i])
+                blocks = blocks[:group_blocks]
+            selected_block_ids.append(blocks)
+        return selected_block_ids
 
     def _get_remote_prefill_token_count(self, num_prompt_tokens: int) -> int:
         """D-side only. Returns N-1 for Mamba models since the decoder
@@ -1104,9 +1188,20 @@ class MooncakeConnectorScheduler:
                     if num_external_tokens > 0
                     else ()
                 )
-                local_block_ids = self.get_sw_clipped_blocks(unhashed_block_ids)
+                num_total_tokens = request.num_computed_tokens + num_external_tokens
+                num_computed_tokens = request.num_computed_tokens
+                local_block_ids = self.get_transfer_block_ids(
+                    unhashed_block_ids,
+                    num_total_tokens=num_total_tokens,
+                    num_computed_tokens=num_computed_tokens,
+                )
                 # Get unhashed blocks to pull from remote.
-                self._reqs_need_recv[request.request_id] = (request, local_block_ids)
+                self._reqs_need_recv[request.request_id] = (
+                    request,
+                    local_block_ids,
+                    num_total_tokens,
+                    num_computed_tokens,
+                )
             else:
                 logger.warning(
                     "Got invalid KVTransferParams: %s. This "
@@ -1132,12 +1227,17 @@ class MooncakeConnectorScheduler:
 
         # Loop through scheduled reqs and convert to PullReqMeta.
         if not self.is_kv_producer:
-            for req_id, (req, block_ids) in self._reqs_need_recv.items():
+            for (
+                req_id,
+                (req, block_ids, num_total_tokens, num_computed_tokens),
+            ) in self._reqs_need_recv.items():
                 assert req.kv_transfer_params is not None
                 meta.add_new_req(
                     request_id=req_id,
                     local_block_ids=block_ids,
                     kv_transfer_params=req.kv_transfer_params,
+                    num_total_tokens=num_total_tokens,
+                    num_computed_tokens=num_computed_tokens,
                 )
             self._reqs_need_recv.clear()
 
@@ -1185,7 +1285,7 @@ class MooncakeConnectorScheduler:
             # we must add empty block_ids to _reqs_need_recv so that our
             # worker side will notify and free blocks in the prefill instance.
             assert not self.is_kv_producer
-            self._reqs_need_recv[request.request_id] = (request, [])
+            self._reqs_need_recv[request.request_id] = (request, [], 0, 0)
             params["do_remote_prefill"] = False
             return False, None
 
@@ -1205,9 +1305,13 @@ class MooncakeConnectorScheduler:
         delay_free_blocks = any(len(group) > 0 for group in block_ids)
 
         if delay_free_blocks:
+            num_total_tokens = request.num_prompt_tokens
             self._reqs_need_send[request.request_id] = (
                 request,
-                self.get_sw_clipped_blocks(block_ids),
+                self.get_transfer_block_ids(
+                    block_ids,
+                    num_total_tokens=num_total_tokens,
+                ),
             )
 
         return delay_free_blocks, None
@@ -1766,6 +1870,125 @@ class MooncakeConnectorWorker:
             for i, group in enumerate(block_ids)
         ]
 
+    @staticmethod
+    def _strip_view_suffix(layer_name: str) -> str:
+        base_name, sep, view_idx = layer_name.rpartition(".view")
+        if sep and view_idx.isdigit():
+            return base_name
+        return layer_name
+
+    def _get_region_specs(self, region: TransferRegion) -> list[KVCacheSpec]:
+        specs: list[KVCacheSpec] = []
+        for layer_name in region.match_layer_names:
+            base_layer_name = self._strip_view_suffix(layer_name)
+            spec = self._layer_specs.get(base_layer_name)
+            if spec is not None and spec not in specs:
+                specs.append(spec)
+        return specs
+
+    @staticmethod
+    def _has_token_range(token_range: tuple[int, int]) -> bool:
+        num_total_tokens, num_computed_tokens = token_range
+        return num_total_tokens > num_computed_tokens
+
+    @staticmethod
+    def _get_compressed_block_interval(
+        spec: KVCacheSpec,
+        token_range: tuple[int, int],
+        *,
+        relative_to_computed: bool,
+    ) -> tuple[int, int] | None:
+        compress_ratio = int(getattr(spec, "compress_ratio", 1) or 1)
+        if compress_ratio <= 1:
+            return None
+
+        num_total_tokens, num_computed_tokens = token_range
+        compressed_total_tokens = num_total_tokens // compress_ratio
+        compressed_computed_tokens = num_computed_tokens // compress_ratio
+        start = compressed_computed_tokens // spec.block_size
+        end = cdiv(compressed_total_tokens, spec.block_size)
+        if end <= start:
+            return (0, 0)
+        if relative_to_computed:
+            return (0, end - start)
+        return (start, end)
+
+    @staticmethod
+    def _get_sliding_window_block_count(spec: KVCacheSpec) -> int | None:
+        sliding_window = getattr(spec, "sliding_window", None)
+        if not sliding_window:
+            return None
+        return cdiv(sliding_window, spec.block_size) + 1
+
+    def _clip_region_block_group(
+        self,
+        block_ids: list[int],
+        region: TransferRegion,
+        token_range: tuple[int, int],
+        *,
+        relative_to_computed: bool,
+    ) -> list[int]:
+        specs = self._get_region_specs(region)
+        if not specs:
+            return block_ids
+        block_id_scale = (
+            1
+            if any(isinstance(spec, MambaSpec) for spec in specs)
+            else self._physical_blocks_per_logical_kv_block
+        )
+
+        sliding_window_counts = [
+            count
+            for spec in specs
+            if (count := self._get_sliding_window_block_count(spec)) is not None
+        ]
+        if sliding_window_counts:
+            return block_ids[-max(sliding_window_counts) * block_id_scale :]
+
+        if not self._has_token_range(token_range):
+            return block_ids
+
+        if any(int(getattr(spec, "compress_ratio", 1) or 1) <= 1 for spec in specs):
+            return block_ids
+
+        intervals: list[tuple[int, int]] = []
+        for spec in specs:
+            interval = self._get_compressed_block_interval(
+                spec,
+                token_range,
+                relative_to_computed=relative_to_computed,
+            )
+            if interval is not None:
+                intervals.append(interval)
+        if not intervals:
+            return block_ids
+
+        start = min(interval[0] for interval in intervals) * block_id_scale
+        end = max(interval[1] for interval in intervals) * block_id_scale
+        return block_ids[start:end]
+
+    def _clip_transfer_blocks_for_region(
+        self,
+        local_group: list[int],
+        remote_group: list[int],
+        local_region: TransferRegion,
+        remote_region: TransferRegion,
+        token_range: tuple[int, int],
+    ) -> tuple[list[int], list[int]]:
+        local_group = self._clip_region_block_group(
+            local_group,
+            local_region,
+            token_range,
+            relative_to_computed=False,
+        )
+        remote_group = self._clip_region_block_group(
+            remote_group,
+            remote_region,
+            token_range,
+            relative_to_computed=True,
+        )
+        return local_group, remote_group
+
     async def _build_transfer_params(
         self,
         ready_reqs: list[tuple[ReqId, SendBlockMeta]],
@@ -1782,6 +2005,8 @@ class MooncakeConnectorWorker:
 
         for d_req_id, send_meta in ready_reqs:
             _, remote_block_ids_per_group = agent_meta.req_blocks[d_req_id]
+            remote_token_range = agent_meta.req_token_ranges.get(d_req_id, (0, 0))
+            has_remote_token_range = self._has_token_range(remote_token_range)
 
             if not remote_block_ids_per_group or all(
                 len(g) == 0 for g in remote_block_ids_per_group
@@ -1806,7 +2031,6 @@ class MooncakeConnectorWorker:
             # reused for every registered region.
             local_block_ids_by_group: list[list[int]] = []
             remote_block_ids_by_group: list[list[int]] = []
-            has_block_error = False
             group_specs = self.kv_cache_config.kv_cache_groups
             for group_index, (local_group, remote_group) in enumerate(
                 zip(send_meta.local_block_ids, remote_block_ids_per_group)
@@ -1830,30 +2054,12 @@ class MooncakeConnectorWorker:
                         if block_id != NULL_BLOCK_ID
                     ]
 
-                n_local = len(local_group)
                 n_remote = len(remote_group)
-                if n_local < n_remote:
-                    logger.error(
-                        "req %s: local blocks(%d) < remote blocks(%d) "
-                        "in a KV cache group (is_mamba_group=%s)",
-                        d_req_id,
-                        n_local,
-                        n_remote,
-                        is_mamba_group,
-                    )
-                    has_block_error = True
-                    break
-                elif n_local > n_remote:
+                if len(local_group) > n_remote and not has_remote_token_range:
                     # Partial prefix cache hit: just read uncomputed blocks.
                     local_group = local_group[-n_remote:] if n_remote > 0 else []
                 local_block_ids_by_group.append(local_group)
                 remote_block_ids_by_group.append(remote_group)
-
-            if has_block_error:
-                err_reqs.append(d_req_id)
-                if err_msg is None:
-                    err_msg = "P num blocks less than D"
-                continue
 
             if not any(local_block_ids_by_group):
                 continue
@@ -1876,6 +2082,21 @@ class MooncakeConnectorWorker:
                     remote_region,
                     num_groups,
                 )
+                group_block_slicer = None
+                if has_remote_token_range:
+                    def group_block_slicer(
+                        _group_idx: int,
+                        local_group: list[int],
+                        remote_group: list[int],
+                    ) -> tuple[list[int], list[int]]:
+                        return self._clip_transfer_blocks_for_region(
+                            local_group,
+                            remote_group,
+                            local_region,
+                            remote_region,
+                            remote_token_range,
+                        )
+
                 (
                     local_block_ids,
                     remote_block_ids,
@@ -1884,6 +2105,7 @@ class MooncakeConnectorWorker:
                     local_block_ids_by_group,
                     remote_block_ids_by_group,
                     region_group_indices,
+                    group_block_slicer=group_block_slicer,
                 )
                 if select_err is not None:
                     logger.error(
@@ -2330,6 +2552,10 @@ class MooncakeConnectorWorker:
             remote_tp_rank=self.tp_rank,
             req_blocks={
                 req_id: (pull_meta.transfer_id, pull_meta.local_block_ids)
+                for req_id, pull_meta in pull_metas.items()
+            },
+            req_token_ranges={
+                req_id: (pull_meta.num_total_tokens, pull_meta.num_computed_tokens)
                 for req_id, pull_meta in pull_metas.items()
             },
             kv_caches_base_addr=self.kv_caches_base_addr,
