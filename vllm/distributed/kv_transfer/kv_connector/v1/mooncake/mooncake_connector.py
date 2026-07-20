@@ -1498,6 +1498,8 @@ class MooncakeConnectorWorker:
         # and draft model may use different attention backends with different
         # physical block sizes. Pick the common (smallest) block size so that
         # KV-cache registration and transfer work correctly for both models.
+        # This only changes block-ID-to-address mapping; it must not truncate
+        # the externally computed token prefix shared by main and draft KV.
         backends = get_current_attn_backends(self.vllm_config)
         kernel_block_size = select_common_block_size(self.block_size, backends)
         if self.block_size != kernel_block_size:
@@ -1877,10 +1879,22 @@ class MooncakeConnectorWorker:
             return base_name
         return layer_name
 
-    def _get_region_specs(self, region: TransferRegion) -> list[KVCacheSpec]:
+    def _get_region_specs(
+        self, region: TransferRegion, group_idx: int | None = None
+    ) -> list[KVCacheSpec]:
+        """Resolve specs for a physical region, optionally for one KV group.
+
+        A shared tensor may alias layers from logical groups with different
+        attention/compression semantics. Filtering before block slicing keeps
+        one group's block IDs from being interpreted with another group's spec.
+        """
         specs: list[KVCacheSpec] = []
         for layer_name in region.match_layer_names:
             base_layer_name = self._strip_view_suffix(layer_name)
+            if group_idx is not None and group_idx not in (
+                self._layer_logical_group_indices.get(base_layer_name, ())
+            ):
+                continue
             spec = self._layer_specs.get(base_layer_name)
             if spec is not None and spec not in specs:
                 specs.append(spec)
@@ -1927,8 +1941,9 @@ class MooncakeConnectorWorker:
         token_range: tuple[int, int],
         *,
         relative_to_computed: bool,
+        group_idx: int | None = None,
     ) -> list[int]:
-        specs = self._get_region_specs(region)
+        specs = self._get_region_specs(region, group_idx)
         if not specs:
             return block_ids
         block_id_scale = (
@@ -1974,18 +1989,21 @@ class MooncakeConnectorWorker:
         local_region: TransferRegion,
         remote_region: TransferRegion,
         token_range: tuple[int, int],
+        group_idx: int,
     ) -> tuple[list[int], list[int]]:
         local_group = self._clip_region_block_group(
             local_group,
             local_region,
             token_range,
             relative_to_computed=False,
+            group_idx=group_idx,
         )
         remote_group = self._clip_region_block_group(
             remote_group,
             remote_region,
             token_range,
             relative_to_computed=True,
+            group_idx=group_idx,
         )
         return local_group, remote_group
 
@@ -2085,7 +2103,7 @@ class MooncakeConnectorWorker:
                 group_block_slicer = None
                 if has_remote_token_range:
                     def group_block_slicer(
-                        _group_idx: int,
+                        group_idx: int,
                         local_group: list[int],
                         remote_group: list[int],
                     ) -> tuple[list[int], list[int]]:
@@ -2095,6 +2113,7 @@ class MooncakeConnectorWorker:
                             local_region,
                             remote_region,
                             remote_token_range,
+                            group_idx,
                         )
 
                 (
@@ -2310,16 +2329,16 @@ class MooncakeConnectorWorker:
 
         for layer_name, cache_or_caches in kv_caches.items():
             layer_index = extract_layer_index(layer_name)
-            # DeepSeek V4 MTP draft caches are named after the base model
-            # layers, so their layer indices are outside the base layer range.
-            if is_mtp_speculative and layer_index >= total_num_hidden_layers:
-                logger.debug(
-                    "Skipping MTP speculative KV cache layer %s outside the "
-                    "base model layer range [0, %d)",
-                    layer_name,
-                    total_num_hidden_layers,
-                )
-                continue
+            # Some model implementations name MTP caches as ``mtp.0`` while
+            # others append them after the base model layers. Use one physical
+            # index space on the wire so both forms are transferred without
+            # colliding with base layer 0.
+            if (
+                is_mtp_speculative
+                and ".mtp." in f".{layer_name}."
+                and layer_index < total_num_hidden_layers
+            ):
+                layer_index += total_num_hidden_layers
             layer_spec = self._layer_specs.get(layer_name)
             if layer_spec is None:
                 logger.debug(

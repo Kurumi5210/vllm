@@ -4,6 +4,7 @@
 import asyncio
 import contextlib
 import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -15,18 +16,26 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     KVConnectorRole,
     MooncakeConnector,
     MooncakeConnectorMetadata,
+    MooncakeConnectorScheduler,
+    MooncakeConnectorWorker,
     MooncakeXferMetadata,
     MooncakeXferResponse,
     MooncakeXferResponseStatus,
     PullReqMeta,
     SendBlockMeta,
+    TransferRegion,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import (
     MooncakeBootstrapServer,
 )
 from vllm.utils.network_utils import get_open_port
 from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    SlidingWindowSpec,
+)
 from vllm.v1.request import RequestStatus
 
 from .utils import create_request, create_scheduler, create_vllm_config
@@ -34,6 +43,94 @@ from .utils import create_request, create_scheduler, create_vllm_config
 
 def _make_test_kv_cache_config() -> KVCacheConfig:
     return KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[])
+
+
+def _make_mtp_test_kv_cache_config(mtp_layer_name: str) -> KVCacheConfig:
+    def make_spec() -> FullAttentionSpec:
+        return FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=4,
+            head_size=64,
+            dtype=torch.float16,
+        )
+
+    return KVCacheConfig(
+        num_blocks=0,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["model.layers.0.self_attn"], make_spec()),
+            KVCacheGroupSpec([mtp_layer_name], make_spec()),
+        ],
+    )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+def test_remote_prefill_does_not_apply_eagle_prefix_cache_alignment():
+    scheduler = MooncakeConnectorScheduler.__new__(MooncakeConnectorScheduler)
+    scheduler._has_mamba = False
+    scheduler._has_eagle = True
+
+    # Direct P/D transfer moves KV for the same request. EAGLE's trailing-block
+    # drop applies to hash-based prefix-cache reuse, not to this transfer path.
+    assert scheduler._get_remote_prefill_token_count(167) == 167
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+def test_shared_region_transfer_uses_current_group_spec():
+    layer_name = "model.layers.1.self_attn"
+    spec = SlidingWindowSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float16,
+        sliding_window=128,
+    )
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.shutdown = MagicMock()
+    worker._layer_specs = {layer_name: spec}
+    worker._physical_blocks_per_logical_kv_block = 1
+    non_mtp_region = TransferRegion(
+        layer_name=layer_name,
+        layer_index=1,
+        base_addr=0x2000,
+        block_len=256,
+        kv_block_len=256,
+        group_index=0,
+    )
+    compressed_spec = SlidingWindowSpec(
+        block_size=2,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float16,
+        sliding_window=8,
+    )
+    object.__setattr__(compressed_spec, "compress_ratio", 128)
+    compressed_layer_name = "model.layers.2.self_attn"
+    worker._layer_specs[compressed_layer_name] = compressed_spec
+    worker._layer_logical_group_indices = {
+        non_mtp_region.layer_name: [0],
+        compressed_layer_name: [1],
+    }
+    shared_region = TransferRegion(
+        layer_name=non_mtp_region.layer_name,
+        layer_index=1,
+        base_addr=0x2000,
+        block_len=256,
+        kv_block_len=256,
+        group_index=0,
+        layer_aliases=(non_mtp_region.layer_name, compressed_layer_name),
+    )
+    # A shared physical region must select the compressed spec belonging to
+    # the current logical group, not mix it with the uncompressed SWA alias.
+    assert worker._clip_region_block_group(
+        list(range(400, 499)),
+        shared_region,
+        (25280, 0),
+        relative_to_computed=False,
+        group_idx=1,
+    ) == list(range(494, 499))
 
 
 class FakeMooncakeWrapper:
@@ -643,6 +740,61 @@ def test_register_kv_caches():
             assert len(worker.block_len_per_layer) == len(registered_ptrs)
             for bl in worker.block_len_per_layer:
                 assert bl == tensor1.nbytes // tensor1.shape[0]
+
+
+@pytest.mark.parametrize("mtp_naming", ["namespace", "appended_layer"])
+@pytest.mark.skip_global_cleanup
+def test_register_kv_caches_includes_mtp_layer(mtp_naming):
+    """MTP caches use one physical index space and are never skipped."""
+
+    base_layers = 2
+    mtp_layer_name = (
+        "mtp.0.self_attn"
+        if mtp_naming == "namespace"
+        else f"model.layers.{base_layers}.self_attn"
+    )
+    kv_cache_config = _make_mtp_test_kv_cache_config(mtp_layer_name)
+    base_layer_name = "model.layers.0.self_attn"
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.shutdown = MagicMock()
+    worker.use_mla = False
+    worker.vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(method="mtp")
+    )
+    worker.model_config = SimpleNamespace(
+        get_total_num_hidden_layers=lambda: base_layers
+    )
+    worker._layer_specs = {
+        base_layer_name: kv_cache_config.kv_cache_groups[0].kv_cache_spec,
+        mtp_layer_name: kv_cache_config.kv_cache_groups[1].kv_cache_spec,
+    }
+    worker._layer_group_indices = {base_layer_name: 0, mtp_layer_name: 1}
+    worker._layer_logical_group_indices = {
+        base_layer_name: [0],
+        mtp_layer_name: [1],
+    }
+    worker.transfer_topo = SimpleNamespace(
+        virtually_split_kv_in_blocks=False,
+        get_transfer_cache_regions=lambda cache, _spec: [cache],
+    )
+    worker.engine = MagicMock()
+    worker.engine.batch_register_memory.return_value = 0
+    worker.is_kv_consumer = True
+
+    kv_cache_shape = FlashAttentionBackend.get_kv_cache_shape(
+        num_blocks=2, block_size=16, num_kv_heads=4, head_size=64
+    )
+    kv_caches = {
+        base_layer_name: torch.zeros(*kv_cache_shape, dtype=torch.float16),
+        mtp_layer_name: torch.zeros(*kv_cache_shape, dtype=torch.float16),
+    }
+
+    worker.register_kv_caches(kv_caches)
+
+    worker.engine.batch_register_memory.assert_called_once()
+    assert worker.registered_layer_names == list(kv_caches)
+    assert worker.registered_layer_indices == [0, base_layers]
+    assert worker.registered_group_indices == [0, 1]
 
 
 def test_register_kv_caches_supports_mixed_mla_and_eagle_shapes():
