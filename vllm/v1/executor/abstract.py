@@ -249,8 +249,21 @@ class Executor(ABC):
     def execute_dummy_batch(self) -> None:
         self.collective_rpc("execute_dummy_batch")
 
-    def take_draft_token_ids(self) -> DraftTokenIds | None:
-        output: list[DraftTokenIds] = self.collective_rpc("take_draft_token_ids")
+    def take_draft_token_ids(self, non_block: bool = False) -> DraftTokenIds | None:
+        output = self.collective_rpc(
+            "take_draft_token_ids", non_block=non_block
+        )
+        if non_block:
+            first_result_future: Future[DraftTokenIds | None] = Future()
+
+            def set_first_result(rpc_future: Future[list[DraftTokenIds]]) -> None:
+                try:
+                    first_result_future.set_result(rpc_future.result()[0])
+                except BaseException as error:
+                    first_result_future.set_exception(error)
+
+            output.add_done_callback(set_first_result)
+            return first_result_future  # type: ignore[return-value]
         return output[0]
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):

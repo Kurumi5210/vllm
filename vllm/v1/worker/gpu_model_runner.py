@@ -230,6 +230,16 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+
+def _valid_sampled_token_counts(sampled_token_ids: torch.Tensor) -> torch.Tensor:
+    return (sampled_token_ids != -1).sum(dim=1)
+
+
+def _latest_sampled_token_ids(sampled_token_ids: torch.Tensor) -> torch.Tensor:
+    last_indices = (_valid_sampled_token_counts(sampled_token_ids) - 1).clamp(min=0)
+    return sampled_token_ids.gather(1, last_indices.unsqueeze(1)).squeeze(1)
+
+
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
@@ -618,6 +628,8 @@ class GPUModelRunner(
             self.rejection_sampler = RejectionSampler(
                 self.sampler, self.speculative_config, self.device
             )
+        else:
+            self.drafter = None
 
         self.num_spec_tokens = 0
         self.valid_sampled_token_count_gpu: torch.Tensor | None = None
@@ -630,6 +642,13 @@ class GPUModelRunner(
                 self.effective_drafter_max_model_len = self.max_model_len
         self.use_async_spec_decode = (
             self.use_async_scheduling and self.num_spec_tokens > 0
+        )
+        # PP+MTP exchanges one fixed-width sampled/draft frame per pipeline
+        # batch. This transport is required in both sync and async scheduling.
+        self.use_pp_mtp_broadcast = (
+            self.num_spec_tokens > 0
+            and len(get_pp_group().ranks) > 1
+            and not self.broadcast_pp_output
         )
 
         # Request states.
@@ -831,6 +850,7 @@ class GPUModelRunner(
 
         # Cached outputs.
         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
+        self._pp_prev_valid_sampled_count: dict[str, int] = {}
         self._draft_probs: torch.Tensor | None = None
         self._draft_prob_req_ids: list[str] | None = None
         # N-gram GPU path: async D2H buffer/event for per-request valid draft counts.
@@ -1136,6 +1156,7 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            self._pp_prev_valid_sampled_count.pop(req_id, None)
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
@@ -1310,15 +1331,36 @@ class GPUModelRunner(
                     optimistic_num_accepted = req_state.prev_num_draft_len
                     req_state.output_token_ids.extend([-1] * optimistic_num_accepted)
 
-                    deferred_spec_decode_corrections.append(
-                        (req_id, optimistic_num_accepted, req_state)
-                    )
-
                     prev_req_index = (
                         self.input_batch.prev_req_id_to_index.get(req_id)
                         if self.input_batch.prev_req_id_to_index
                         else None
                     )
+                    if not is_last_rank and prev_req_index is not None:
+                        valid_count = self._pp_prev_valid_sampled_count.pop(
+                            req_id, None
+                        )
+                        if valid_count is None:
+                            raise RuntimeError(
+                                "Missing sampled-token frame for PP request "
+                                f"{req_id}: frame_request_ids="
+                                f"{sorted(self._pp_prev_valid_sampled_count)}, "
+                                "previous_batch_request_ids="
+                                f"{sorted(self.input_batch.prev_req_id_to_index or {})}"
+                            )
+                        correction = 1 + optimistic_num_accepted - valid_count
+                        if correction < 0:
+                            raise RuntimeError(
+                                "Invalid accepted-token count for PP request "
+                                f"{req_id}: drafts={optimistic_num_accepted}, "
+                                f"accepted_with_bonus={valid_count}"
+                            )
+                        num_computed_tokens -= correction
+
+                    deferred_spec_decode_corrections.append(
+                        (req_id, optimistic_num_accepted, req_state)
+                    )
+
                     if prev_req_index is not None:
                         self.prev_num_draft_tokens.np[prev_req_index] = (
                             optimistic_num_accepted
@@ -1333,25 +1375,30 @@ class GPUModelRunner(
             req_state.num_computed_tokens = num_computed_tokens
 
             if not is_last_rank:
-                if not req_data.new_token_ids:
-                    # Async scheduled PP: Sampled tokens propagated via GPU broadcast.
+                if self.use_pp_mtp_broadcast or not req_data.new_token_ids:
+                    # Sampled tokens were propagated directly between PP ranks.
                     new_token_ids: list[int] = []
+                    num_new_output_tokens = 0
                 else:
                     # Non-async scheduling with PP: The scheduler sends
                     # sampled token ids back because there's no direct communication
                     # between the first-stage worker and the last-stage worker.
                     new_token_ids = req_data.new_token_ids[i]
-                    # Add the sampled token(s) from the previous step (if any).
-                    # This doesn't include "unverified" tokens like spec tokens.
-                    num_new_tokens = (
-                        num_computed_tokens + len(new_token_ids) - req_state.num_tokens
+                    num_new_output_tokens = num_output_tokens - len(
+                        req_state.output_token_ids
                     )
-                    if num_new_tokens == 1:
+                    if not 0 <= num_new_output_tokens <= len(new_token_ids):
+                        raise RuntimeError(
+                            "Invalid PP sampled-token frame for request "
+                            f"{req_id}: frame_width={len(new_token_ids)}, "
+                            f"new_output_tokens={num_new_output_tokens}"
+                        )
+                    if num_new_output_tokens == 1:
                         # Avoid slicing list in most common case.
                         req_state.output_token_ids.append(new_token_ids[-1])
-                    elif num_new_tokens > 0:
+                    elif num_new_output_tokens > 0:
                         req_state.output_token_ids.extend(
-                            new_token_ids[-num_new_tokens:]
+                            new_token_ids[-num_new_output_tokens:]
                         )
             elif num_output_tokens < len(req_state.output_token_ids):
                 # Some output tokens were discarded due to a sync-KV-load
@@ -1383,7 +1430,10 @@ class GPUModelRunner(
                 # The request was either preempted and resumed later, or was not
                 # scheduled in the previous step and needs to be added again.
 
-                if self.use_async_scheduling and num_output_tokens > 0:
+                if (
+                    num_output_tokens > 0
+                    and (self.use_async_scheduling or not is_last_rank)
+                ):
                     # We must recover the output token ids for resumed requests in the
                     # async scheduling case, so that correct input_ids are obtained.
                     resumed_token_ids = req_data.all_token_ids[req_id]
@@ -1410,20 +1460,32 @@ class GPUModelRunner(
                 # according to num_computed_tokens.
                 end_token_index = max(
                     start_token_index,
-                    num_computed_tokens + len(new_token_ids),
+                    num_computed_tokens,
+                    start_token_index + num_new_output_tokens,
                 )
                 if end_token_index > start_token_index:
                     if new_token_ids:
                         # Add new_token_ids to token_ids_cpu.
-                        num_new_tokens = end_token_index - start_token_index
-                        tokens_to_append = new_token_ids[-num_new_tokens:]
+                        num_tokens_to_copy = min(
+                            len(new_token_ids), end_token_index - start_token_index
+                        )
+                        copy_start = end_token_index - num_tokens_to_copy
                         self.input_batch.token_ids_cpu[
-                            req_index, start_token_index:end_token_index
-                        ] = tokens_to_append
+                            req_index, copy_start:end_token_index
+                        ] = new_token_ids[-num_tokens_to_copy:]
                     self.input_batch.is_token_ids[
                         req_index, start_token_index:end_token_index
                     ] = True
                     self.input_batch.num_tokens_no_spec[req_index] = end_token_index
+
+                if (
+                    self.num_spec_tokens
+                    and not self.use_async_scheduling
+                    and new_token_ids
+                ):
+                    self.input_batch.num_accepted_tokens_cpu[req_index] = len(
+                        new_token_ids
+                    )
 
             # Add spec_token_ids to token_ids_cpu.
             self.input_batch.update_req_spec_token_ids(req_state, scheduled_spec_tokens)
@@ -1782,9 +1844,17 @@ class GPUModelRunner(
             # and no reordering happened.
             # The indices are both the same permutation of 0..N-1 so
             # we can copy directly using a single slice.
+            prev_sampled_token_ids = self.input_batch.prev_sampled_token_ids[
+                :num_common_tokens
+            ]
+            if self.num_spec_tokens:
+                prev_sampled_token_ids = _latest_sampled_token_ids(
+                    prev_sampled_token_ids
+                )
+            else:
+                prev_sampled_token_ids = prev_sampled_token_ids[:, 0]
             self.input_ids.gpu[:num_common_tokens].copy_(
-                self.input_batch.prev_sampled_token_ids[:num_common_tokens, 0],
-                non_blocking=True,
+                prev_sampled_token_ids, non_blocking=True
             )
             return
         # Upload the index tensors asynchronously so the scatter can be non-blocking.
@@ -1794,12 +1864,15 @@ class GPUModelRunner(
         prev_common_req_indices_tensor = torch.tensor(
             prev_indices, dtype=torch.int64, pin_memory=self.pin_memory
         ).to(self.device, non_blocking=True)
+        prev_sampled_token_ids = self.input_batch.prev_sampled_token_ids
+        if self.num_spec_tokens:
+            prev_sampled_token_ids = _latest_sampled_token_ids(prev_sampled_token_ids)
+        else:
+            prev_sampled_token_ids = prev_sampled_token_ids[:, 0]
         self.input_ids.gpu.scatter_(
             dim=0,
             index=sampled_tokens_index_tensor,
-            src=self.input_batch.prev_sampled_token_ids[
-                prev_common_req_indices_tensor, 0
-            ],
+            src=prev_sampled_token_ids[prev_common_req_indices_tensor],
         )
 
         # Scatter the draft tokens after the sampled tokens are scattered.
@@ -4387,8 +4460,12 @@ class GPUModelRunner(
         if self.execute_model_state is None:
             kv_connector_output = self.kv_connector_output
             self.kv_connector_output = None
-            # receive sampled token ids from the last PP rank.
-            if self.use_async_scheduling and not get_pp_group().is_last_rank:
+            # Receive the previous sampled/draft frame from the last PP rank
+            # whenever direct PP transport is active.
+            if (
+                (self.use_async_scheduling or self.use_pp_mtp_broadcast)
+                and not get_pp_group().is_last_rank
+            ):
                 self._pp_receive_prev_sampled_token_ids_to_input_batch()
             # In case of PP with kv transfer, we need to pass through the
             # kv_connector_output
@@ -4422,7 +4499,7 @@ class GPUModelRunner(
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
         )
-        if self.use_async_scheduling:
+        if self.use_async_scheduling or self.use_pp_mtp_broadcast:
             pp = get_pp_group()
             # For torchrun external_launcher PP mode with broadcast_pp_output=True,
             # PP outputs have been broadcasted to all ranks at logits computation.
@@ -4554,6 +4631,11 @@ class GPUModelRunner(
             # tokens on the CPU, so they are run after bookkeeping.
             propose_draft_token_ids(valid_sampled_token_ids)
 
+        if self.use_async_spec_decode or self.use_pp_mtp_broadcast:
+            pp = get_pp_group()
+            if pp.world_size > 1 and pp.is_last_rank:
+                self._pp_broadcast_draft_token_ids()
+
         # Finalize KV connector (wait_for_save + clear metadata) after
         # draft model runs. Deferred from target model forward to allow
         # draft model to also save its KV cache.
@@ -4648,45 +4730,150 @@ class GPUModelRunner(
         """Broadcast sampled token ids (GPU) from last PP stage"""
         pp = get_pp_group()
         assert pp.is_last_rank
-        # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
-        assert sampled_token_ids.dim() == 2 and sampled_token_ids.shape[-1] == 1, (
-            "PP+async expects sampled_token_ids to have shape [num_reqs, 1]"
-        )
         # Skip for chunked prefill: sampled tokens are dummy
         # and will be discarded, no need to broadcast.
-        if not self._is_all_reqs_chunked_prefill():
-            torch.distributed.broadcast(
-                sampled_token_ids, src=pp.rank, group=pp.device_group
+        if self._is_all_reqs_chunked_prefill():
+            return
+
+        width = self.num_spec_tokens + 1
+        if sampled_token_ids.dim() != 2 or sampled_token_ids.shape[-1] > width:
+            raise RuntimeError(
+                "Invalid PP sampled-token frame shape: "
+                f"shape={tuple(sampled_token_ids.shape)}, expected_width={width}"
             )
+        if sampled_token_ids.shape[-1] < width:
+            pad = sampled_token_ids.new_full(
+                (sampled_token_ids.shape[0], width - sampled_token_ids.shape[-1]),
+                -1,
+            )
+            sampled_token_ids = torch.cat((sampled_token_ids, pad), dim=1)
+        torch.distributed.broadcast(
+            sampled_token_ids, src=pp.rank, group=pp.device_group
+        )
+
+    def _pp_broadcast_draft_token_ids(self) -> None:
+        pp = get_pp_group()
+        assert pp.is_last_rank
+        if self._is_all_reqs_chunked_prefill():
+            return
+        if not torch.is_tensor(self._draft_token_ids):
+            raise RuntimeError("Missing draft-token frame on the last PP rank")
+
+        draft_token_ids = self._draft_token_ids.to(dtype=torch.int32)
+        expected_shape = (self.input_batch.num_reqs, self.num_spec_tokens)
+        if (
+            draft_token_ids.dim() != 2
+            or draft_token_ids.shape[0] < expected_shape[0]
+            or draft_token_ids.shape[1] < expected_shape[1]
+        ):
+            raise RuntimeError(
+                "Invalid PP draft-token frame shape: "
+                f"shape={tuple(draft_token_ids.shape)}, minimum={expected_shape}"
+            )
+        draft_token_ids = draft_token_ids[
+            : expected_shape[0], : expected_shape[1]
+        ].contiguous()
+        torch.distributed.broadcast(
+            draft_token_ids, src=pp.rank, group=pp.device_group
+        )
 
     def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
         """Receive sampled token ids broadcast from last PP stage"""
         pp = get_pp_group()
         assert not pp.is_last_rank
         num_reqs = self.input_batch.num_reqs
-        # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
-        recv = torch.empty((num_reqs, 1), dtype=torch.int32, device=self.device)
-        # skip for chunked prefill.
-        if not self._is_all_reqs_chunked_prefill():
-            torch.distributed.broadcast(recv, src=pp.last_rank, group=pp.device_group)
-        self.input_batch.prev_sampled_token_ids = recv
-
-        # construct `prev_req_id_to_index` here so `_prepare_input_ids`
-        # can map req_id -> previous batch row
         discard_req_indices = np.nonzero(self.discard_request_mask.np[:num_reqs])[0]
         discard_req_indices_set = set(discard_req_indices)
         prev_req_id_to_index: dict[str, int] = {}
+
+        if not self.num_spec_tokens:
+            recv = torch.empty((num_reqs, 1), dtype=torch.int32, device=self.device)
+            if not self._is_all_reqs_chunked_prefill():
+                torch.distributed.broadcast(
+                    recv, src=pp.last_rank, group=pp.device_group
+                )
+            self.input_batch.prev_sampled_token_ids = recv
+            for i, req_id in enumerate(self.input_batch.req_ids):
+                if i in discard_req_indices_set:
+                    continue
+                prev_req_id_to_index[req_id] = i
+                if (req_state := self.requests.get(req_id)) is not None:
+                    req_state.output_token_ids.append(-1)
+                pos = self.input_batch.num_tokens_no_spec[i]
+                self.input_batch.is_token_ids[i, pos] = True
+                self.input_batch.num_tokens_no_spec[i] = pos + 1
+            self.input_batch.prev_req_id_to_index = prev_req_id_to_index
+            return
+
+        width = self.num_spec_tokens + 1
+        if self._is_all_reqs_chunked_prefill():
+            self.input_batch.prev_sampled_token_ids = torch.empty(
+                (num_reqs, width), dtype=torch.int32, device=self.device
+            )
+            self.input_batch.prev_req_id_to_index = {}
+            return
+
+        recv = torch.empty(
+            (num_reqs, width), dtype=torch.int32, device=self.device
+        )
+        torch.distributed.broadcast(recv, src=pp.last_rank, group=pp.device_group)
+        draft_token_ids = torch.empty(
+            (num_reqs, self.num_spec_tokens),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        torch.distributed.broadcast(
+            draft_token_ids, src=pp.last_rank, group=pp.device_group
+        )
+        self.input_batch.prev_sampled_token_ids = recv
+        self._draft_token_ids = draft_token_ids
+
+        valid_counts = _valid_sampled_token_counts(recv)
+        valid_counts_cpu = valid_counts.tolist()
+        sampled_token_ids_cpu = recv.tolist()
+        valid_rows = (
+            (i, row, count)
+            for i, (row, count) in enumerate(
+                zip(sampled_token_ids_cpu, valid_counts_cpu)
+            )
+            if i not in discard_req_indices_set
+        )
+        valid_rows = list(valid_rows)
+        if any(count <= 0 for _, _, count in valid_rows):
+            raise RuntimeError(
+                "PP sampled-token frame contains a request without a valid token"
+            )
+        if any(
+            -1 in row[:count] or any(token != -1 for token in row[count:])
+            for _, row, count in valid_rows
+        ):
+            raise RuntimeError("PP sampled-token frame has non-contiguous padding")
+
         for i, req_id in enumerate(self.input_batch.req_ids):
             if i in discard_req_indices_set:
                 continue
             prev_req_id_to_index[req_id] = i
-            # PP+async scheduling: advance per-request local cached output length by
-            # appending a placeholder (-1) token id.
-            if (req_state := self.requests.get(req_id)) is not None:
-                req_state.output_token_ids.append(-1)
+            valid_count = valid_counts_cpu[i]
+            sampled_token_ids = sampled_token_ids_cpu[i][:valid_count]
             pos = self.input_batch.num_tokens_no_spec[i]
-            self.input_batch.is_token_ids[i, pos] = True
-            self.input_batch.num_tokens_no_spec[i] = pos + 1
+            end = pos + valid_count
+            self.input_batch.token_ids_cpu[i, pos:end] = sampled_token_ids
+            self.input_batch.is_token_ids[i, pos:end] = True
+            self.input_batch.num_tokens_no_spec[i] = end
+
+            if (req_state := self.requests.get(req_id)) is not None:
+                optimistic_draft_count = req_state.prev_num_draft_len
+                if optimistic_draft_count:
+                    del req_state.output_token_ids[-optimistic_draft_count:]
+                req_state.output_token_ids.extend(sampled_token_ids)
+            if self.use_async_scheduling:
+                self._pp_prev_valid_sampled_count[req_id] = valid_count
+
+        if self.model_config.is_hybrid and self.num_accepted_tokens_event is not None:
+            self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
+                valid_counts, non_blocking=True
+            )
+            self.num_accepted_tokens_event.record()
         self.input_batch.prev_req_id_to_index = prev_req_id_to_index
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
@@ -5898,10 +6085,14 @@ class GPUModelRunner(
             else:
                 hidden_states = outputs
 
-            if self.speculative_config and (
-                self.speculative_config.use_eagle()
-                or self.speculative_config.uses_draft_model()
-                or self.speculative_config.uses_extract_hidden_states()
+            if (
+                self.speculative_config
+                and get_pp_group().is_last_rank
+                and (
+                    self.speculative_config.use_eagle()
+                    or self.speculative_config.uses_draft_model()
+                    or self.speculative_config.uses_extract_hidden_states()
+                )
             ):
                 assert isinstance(
                     self.drafter,
@@ -6805,9 +6996,13 @@ class GPUModelRunner(
         self.calculate_reorder_batch_threshold()
 
         # Initialize drafter attention backend
-        if self.speculative_config and (
-            self.speculative_config.use_eagle()
-            or self.speculative_config.uses_draft_model()
+        if (
+            self.speculative_config
+            and get_pp_group().is_last_rank
+            and (
+                self.speculative_config.use_eagle()
+                or self.speculative_config.uses_draft_model()
+            )
         ):
             assert isinstance(
                 self.drafter,
@@ -6858,9 +7053,13 @@ class GPUModelRunner(
         )
 
         # Initialize drafter's cudagraph dispatcher if using spec decode.
-        if self.speculative_config and (
-            self.speculative_config.use_eagle()
-            or self.speculative_config.uses_extract_hidden_states()
+        if (
+            self.speculative_config
+            and get_pp_group().is_last_rank
+            and (
+                self.speculative_config.use_eagle()
+                or self.speculative_config.uses_extract_hidden_states()
+            )
         ):
             assert isinstance(
                 self.drafter,
@@ -7322,6 +7521,7 @@ class GPUModelRunner(
 
         if (
             self.speculative_config
+            and get_pp_group().is_last_rank
             and self.speculative_config.uses_extract_hidden_states()
         ):
             assert isinstance(self.drafter, ExtractHiddenStatesProposer)

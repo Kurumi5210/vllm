@@ -101,7 +101,9 @@ class Scheduler(SchedulerInterface):
         self.prev_step_scheduled_req_ids: set[str] = set()
 
         # Scheduling constraints.
-        self.max_num_running_reqs = self.scheduler_config.max_num_seqs
+        pp_size = self.parallel_config.pipeline_parallel_size
+        self.max_num_running_reqs = self.scheduler_config.max_num_seqs * pp_size
+        self.max_num_reqs_per_batch = self.scheduler_config.max_num_seqs
         self.max_num_scheduled_tokens = (
             self.scheduler_config.max_num_scheduled_tokens
             if self.scheduler_config.max_num_scheduled_tokens is not None
@@ -248,6 +250,21 @@ class Scheduler(SchedulerInterface):
             self.connector.bind_gpu_block_pool(self.kv_cache_manager.block_pool)
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+        # In the in-process PP backend, PP+MTP workers exchange the sampled
+        # frame directly. The external-launcher path already broadcasts the
+        # model output and must keep the scheduler handoff.
+        self.pp_mtp_broadcast = (
+            self.use_pp
+            and self.num_spec_tokens > 0
+            and self.parallel_config.distributed_executor_backend
+            != "external_launcher"
+        )
+        self.sync_pp_spec = (
+            self.use_pp
+            and self.num_spec_tokens > 0
+            and not self.scheduler_config.async_scheduling
+        )
+        self._pending_sampled_token_ids: dict[str, list[int]] = {}
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
         # cadence (`next_decode_eligible_step`).
@@ -378,6 +395,14 @@ class Scheduler(SchedulerInterface):
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
 
+            current_batch_size = (
+                len(scheduled_new_reqs)
+                + len(scheduled_resumed_reqs)
+                + len(scheduled_running_reqs)
+            )
+            if current_batch_size >= self.max_num_reqs_per_batch:
+                break
+
             if (
                 request.num_output_placeholders > 0
                 # This is (num_computed_tokens + 1) - (num_output_placeholders - 1).
@@ -403,6 +428,7 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = (
                 request.num_tokens_with_spec
                 + request.num_output_placeholders
+                + request.num_spec_tokens_in_flight
                 - request.num_computed_tokens
             )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
@@ -414,6 +440,14 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = min(
                 num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens
             )
+
+            if num_new_tokens < 0:
+                raise RuntimeError(
+                    "Scheduler computed a negative token count for request "
+                    f"{request.request_id}: num_new_tokens={num_new_tokens}, "
+                    f"num_tokens_with_spec={request.num_tokens_with_spec}, "
+                    f"num_computed_tokens={request.num_computed_tokens}"
+                )
 
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
@@ -564,7 +598,15 @@ class Scheduler(SchedulerInterface):
             step_skipped_waiting = create_request_queue(self.policy)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
-                if len(self.running) == self.max_num_running_reqs:
+                current_batch_size = (
+                    len(scheduled_new_reqs)
+                    + len(scheduled_resumed_reqs)
+                    + len(scheduled_running_reqs)
+                )
+                if (
+                    len(self.running) >= self.max_num_running_reqs
+                    or current_batch_size >= self.max_num_reqs_per_batch
+                ):
                     break
 
                 request_queue = self._select_waiting_queue_for_scheduling()
@@ -985,6 +1027,8 @@ class Scheduler(SchedulerInterface):
         self._inflight_prefills.discard(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
+        request.num_spec_tokens_in_flight = 0
+        self._pending_sampled_token_ids.pop(request.request_id, None)
         if request.spec_token_ids:
             request.spec_token_ids = []
         request.num_preemptions += 1
@@ -1005,9 +1049,14 @@ class Scheduler(SchedulerInterface):
         # 3. If some tokens (e.g. spec tokens) are rejected later, the number of
         #    computed tokens will be adjusted in update_from_output.
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
             request.num_computed_tokens += num_scheduled_token
+            if self.sync_pp_spec:
+                request.num_spec_tokens_in_flight = len(
+                    scheduled_spec_tokens.get(req_id, ())
+                )
             request.is_prefill_chunk = request.num_computed_tokens < (
                 request.num_tokens + request.num_output_placeholders
             )
@@ -1102,21 +1151,28 @@ class Scheduler(SchedulerInterface):
         for idx, req in enumerate(itertools.chain(running_reqs, resumed_reqs)):
             req_id = req.request_id
             req_ids.append(req_id)
-            # NOTE: In PP+async scheduling, we consume token ids via a direct GPU
-            # broadcast path (`input_batch.prev_sampled_token_ids`), so we can
-            # omit this payload.
-            if self.use_pp and not self.scheduler_config.async_scheduling:
+            # PP+MTP (and PP+async) consume token ids via the direct PP frame
+            # path (`input_batch.prev_sampled_token_ids`), so omit this payload
+            # when that transport is active.
+            if (
+                self.use_pp
+                and not self.scheduler_config.async_scheduling
+                and not self.pp_mtp_broadcast
+            ):
                 # When using PP, the scheduler sends the sampled tokens back,
                 # because there's no direct communication between the first-
                 # stage worker and the last-stage worker. Otherwise, we don't
                 # need to send the sampled tokens back because the model runner
                 # will cache them.
-                num_tokens = num_scheduled_tokens[req_id] - len(
-                    spec_decode_tokens.get(req_id, ())
-                )
-                token_ids = req.all_token_ids[
-                    req.num_computed_tokens : req.num_computed_tokens + num_tokens
-                ]
+                if self.sync_pp_spec:
+                    token_ids = self._pending_sampled_token_ids.pop(req_id, [])
+                else:
+                    num_tokens = num_scheduled_tokens[req_id] - len(
+                        spec_decode_tokens.get(req_id, ())
+                    )
+                    token_ids = req.all_token_ids[
+                        req.num_computed_tokens : req.num_computed_tokens + num_tokens
+                    ]
                 new_token_ids.append(token_ids)
             scheduled_in_prev_step = req_id in self.prev_step_scheduled_req_ids
             if idx >= num_running_reqs:
@@ -1414,6 +1470,8 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             )
+            if self.sync_pp_spec:
+                request.num_spec_tokens_in_flight = 0
             if scheduled_spec_token_ids and generated_token_ids:
                 num_draft_tokens = len(scheduled_spec_token_ids)
                 num_accepted = len(generated_token_ids) - 1
@@ -1475,6 +1533,19 @@ class Scheduler(SchedulerInterface):
                     request.status = RequestStatus.FINISHED_ERROR
                     request.resumable = False
                     stopped = True
+
+            if (
+                self.sync_pp_spec
+                and not self.pp_mtp_broadcast
+                and new_token_ids
+                and not stopped
+            ):
+                if req_id in self._pending_sampled_token_ids:
+                    raise RuntimeError(
+                        "Sampled-token frame was not consumed before the next output "
+                        f"for request {req_id}"
+                    )
+                self._pending_sampled_token_ids[req_id] = list(new_token_ids)
 
             routed_experts = None
             if (
@@ -1890,6 +1961,7 @@ class Scheduler(SchedulerInterface):
     ) -> dict[str, Any] | None:
         assert request.is_finished()
 
+        self._pending_sampled_token_ids.pop(request.request_id, None)
         self._inflight_prefills.discard(request)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)

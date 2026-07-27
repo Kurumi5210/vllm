@@ -191,7 +191,15 @@ class EngineCore:
         # to eliminate pipeline bubbles.
         self.batch_queue_size = vllm_config.max_concurrent_batches
         self.batch_queue: (
-            deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]] | None
+            deque[
+                tuple[
+                    Future[ModelRunnerOutput],
+                    SchedulerOutput,
+                    Future[Any],
+                    Future[Any] | None,
+                ]
+            ]
+            | None
         ) = None
         if self.batch_queue_size > 1:
             logger.debug("Batch queue is enabled with size %d", self.batch_queue_size)
@@ -475,7 +483,12 @@ class EngineCore:
         # When using async scheduling we can't get draft token ids in advance,
         # so we update draft token ids in the worker process and don't
         # need to update draft token ids here.
-        if not self.async_scheduling and self.use_spec_decode and model_executed:
+        if (
+            self.batch_queue is None
+            and not self.async_scheduling
+            and self.use_spec_decode
+            and model_executed
+        ):
             # Take the draft token ids.
             draft_token_ids = self.model_executor.take_draft_token_ids()
             if draft_token_ids is not None:
@@ -508,6 +521,7 @@ class EngineCore:
 
         model_executed = False
         deferred_scheduler_output = None
+        draft_token_ids_future = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
             with self.log_error_detail(scheduler_output):
@@ -530,6 +544,10 @@ class EngineCore:
                     future = self.model_executor.sample_tokens(
                         grammar_output, non_block=True
                     )
+                    if not self.async_scheduling and self.use_spec_decode:
+                        draft_token_ids_future = (
+                            self.model_executor.take_draft_token_ids(non_block=True)
+                        )
                 else:
                     # We need to defer sampling until we have processed the model output
                     # from the prior step.
@@ -537,7 +555,14 @@ class EngineCore:
 
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
-                batch_queue.appendleft((future, scheduler_output, exec_future))
+                batch_queue.appendleft(
+                    (
+                        future,
+                        scheduler_output,
+                        exec_future,
+                        draft_token_ids_future,
+                    )
+                )
                 if len(batch_queue) < self.batch_queue_size and (
                     model_executed or self.scheduler.has_requests()
                 ):
@@ -552,7 +577,9 @@ class EngineCore:
             return None, False
 
         # Block until the next result is available.
-        future, scheduler_output, exec_model_fut = batch_queue.pop()
+        future, scheduler_output, exec_model_fut, draft_token_ids_future = (
+            batch_queue.pop()
+        )
         with (
             self.log_error_detail(scheduler_output),
             self.log_iteration_details(scheduler_output),
@@ -570,6 +597,25 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+
+        if draft_token_ids_future is not None:
+            draft_token_ids = draft_token_ids_future.result()
+            sampled_req_ids = set(model_output.req_ids)
+            if draft_token_ids is None:
+                if any(model_output.sampled_token_ids):
+                    raise RuntimeError(
+                        "Missing draft-token frame for sampled PP batch: "
+                        f"request_ids={sorted(sampled_req_ids)}"
+                    )
+            else:
+                draft_req_ids = set(draft_token_ids.req_ids)
+                if draft_req_ids != sampled_req_ids:
+                    raise RuntimeError(
+                        "PP sampled/draft frame request mismatch: "
+                        f"sampled={sorted(sampled_req_ids)}, "
+                        f"draft={sorted(draft_req_ids)}"
+                    )
+                self.scheduler.update_draft_token_ids(draft_token_ids)
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
@@ -593,7 +639,19 @@ class EngineCore:
                 deferred_scheduler_output
             )
             future = self.model_executor.sample_tokens(grammar_output, non_block=True)
-            batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
+            draft_token_ids_future = None
+            if not self.async_scheduling and self.use_spec_decode:
+                draft_token_ids_future = self.model_executor.take_draft_token_ids(
+                    non_block=True
+                )
+            batch_queue.appendleft(
+                (
+                    future,
+                    deferred_scheduler_output,
+                    exec_future,
+                    draft_token_ids_future,
+                )
+            )
 
         return engine_core_outputs, model_executed
 
