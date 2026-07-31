@@ -758,6 +758,8 @@ class PullReqMeta:
     remote_bootstrap_addr: str
     num_total_tokens: int = 0
     num_computed_tokens: int = 0
+    # Cleanup-only pulls release producer blocks without completing a D request.
+    notify_scheduler: bool = True
     # Set expire time to avoid infinitely sending requests.
     expire_time: float = float("inf")
     # Designed for one D pairing to multiple P
@@ -792,6 +794,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         load_remote_cache: bool = True,
         num_total_tokens: int = 0,
         num_computed_tokens: int = 0,
+        notify_scheduler: bool = True,
     ):
         transfer_id = kv_transfer_params["transfer_id"]
         if load_remote_cache:
@@ -804,6 +807,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                 transfer_id=transfer_id,
                 num_total_tokens=num_total_tokens,
                 num_computed_tokens=num_computed_tokens,
+                notify_scheduler=notify_scheduler,
             )
         else:
             self.reqs_to_send[request_id] = (transfer_id, local_block_ids)
@@ -989,7 +993,7 @@ class MooncakeConnectorScheduler:
         # New requests are added by update_state_after_alloc in
         # the scheduler. Used to make metadata passed to Worker.
         self._reqs_need_recv: dict[
-            ReqId, tuple[Request, list[list[int]], int, int]
+            ReqId, tuple[Request, list[list[int]], int, int, bool]
         ] = {}
         self._reqs_need_send: dict[ReqId, tuple[Request, list[list[int]]]] = {}
         # Reqs to remove from processed set because they're not to send after
@@ -1201,6 +1205,7 @@ class MooncakeConnectorScheduler:
                     local_block_ids,
                     num_total_tokens,
                     num_computed_tokens,
+                    True,
                 )
             else:
                 logger.warning(
@@ -1229,7 +1234,13 @@ class MooncakeConnectorScheduler:
         if not self.is_kv_producer:
             for (
                 req_id,
-                (req, block_ids, num_total_tokens, num_computed_tokens),
+                (
+                    req,
+                    block_ids,
+                    num_total_tokens,
+                    num_computed_tokens,
+                    notify_scheduler,
+                ),
             ) in self._reqs_need_recv.items():
                 assert req.kv_transfer_params is not None
                 meta.add_new_req(
@@ -1238,6 +1249,7 @@ class MooncakeConnectorScheduler:
                     kv_transfer_params=req.kv_transfer_params,
                     num_total_tokens=num_total_tokens,
                     num_computed_tokens=num_computed_tokens,
+                    notify_scheduler=notify_scheduler,
                 )
             self._reqs_need_recv.clear()
 
@@ -1285,7 +1297,7 @@ class MooncakeConnectorScheduler:
             # we must add empty block_ids to _reqs_need_recv so that our
             # worker side will notify and free blocks in the prefill instance.
             assert not self.is_kv_producer
-            self._reqs_need_recv[request.request_id] = (request, [], 0, 0)
+            self._reqs_need_recv[request.request_id] = (request, [], 0, 0, False)
             params["do_remote_prefill"] = False
             return False, None
 
@@ -2639,7 +2651,7 @@ class MooncakeConnectorWorker:
             pull_meta = pull_metas[req_id]
             # No race because we are in async loop.
             pull_meta.pull_tasks_count -= 1
-            if pull_meta.pull_tasks_count == 0:
+            if pull_meta.pull_tasks_count == 0 and pull_meta.notify_scheduler:
                 self.finished_recving_reqs.add(pull_meta.d_req_id)
 
         if ok_reqs:
