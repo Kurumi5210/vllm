@@ -384,6 +384,9 @@ class Scheduler(SchedulerInterface):
         encoder_compute_budget = self.max_num_encoder_input_tokens
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
+        # Number of trailing placeholders that keep the execution shape but
+        # do not represent logical draft tokens for each request.
+        num_invalid_spec_tokens: dict[str, int] = {}
         # Whether the running batch contains any prefill requests.
         prefill_scheduled = False
 
@@ -911,6 +914,9 @@ class Scheduler(SchedulerInterface):
                     scheduled_spec_decode_tokens[request_id] = [
                         -1
                     ] * self.num_spec_tokens
+                    # These placeholders enter the forward pass to match the
+                    # graph shape, but must not contribute to draft metrics.
+                    num_invalid_spec_tokens[request_id] = self.num_spec_tokens
                 # Only track requests that will still be prefilling after this chunk.
                 if num_computed_tokens + num_new_tokens < request.num_tokens:
                     self._inflight_prefills.add(request)
@@ -1012,6 +1018,7 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
+            num_invalid_spec_tokens=num_invalid_spec_tokens,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1498,9 +1505,9 @@ class Scheduler(SchedulerInterface):
             if self.sync_pp_spec:
                 request.num_spec_tokens_in_flight = 0
             if scheduled_spec_token_ids and generated_token_ids:
-                num_draft_tokens = len(scheduled_spec_token_ids)
+                num_physical_draft_tokens = len(scheduled_spec_token_ids)
                 num_accepted = len(generated_token_ids) - 1
-                num_rejected = num_draft_tokens - num_accepted
+                num_rejected = num_physical_draft_tokens - num_accepted
                 # num_computed_tokens represents the number of tokens
                 # processed in the current step, considering scheduled
                 # tokens and rejections. If some tokens are rejected,
@@ -1514,7 +1521,7 @@ class Scheduler(SchedulerInterface):
                     request.num_output_placeholders -= num_rejected
                 spec_decoding_stats = self.make_spec_decoding_stats(
                     spec_decoding_stats,
-                    num_draft_tokens=num_draft_tokens,
+                    num_physical_draft_tokens=num_physical_draft_tokens,
                     num_accepted_tokens=num_accepted,
                     num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
                     request_id=req_id,
@@ -1855,7 +1862,9 @@ class Scheduler(SchedulerInterface):
     def update_draft_token_ids_in_output(
         self, draft_token_ids: DraftTokenIds, scheduler_output: SchedulerOutput
     ) -> None:
-        num_invalid_spec_tokens: dict[str, int] = {}
+        num_invalid_spec_tokens = dict(
+            scheduler_output.num_invalid_spec_tokens or {}
+        )
 
         sched_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
         for req_id, spec_token_ids in zip(
@@ -1885,6 +1894,10 @@ class Scheduler(SchedulerInterface):
             if num_invalid_tokens:
                 spec_token_ids.extend([-1] * num_invalid_tokens)
                 num_invalid_spec_tokens[req_id] = num_invalid_tokens
+            else:
+                # A complete draft frame replaces any padding previously
+                # registered for this request.
+                num_invalid_spec_tokens.pop(req_id, None)
 
             sched_spec_tokens[req_id] = spec_token_ids
 
@@ -2158,19 +2171,29 @@ class Scheduler(SchedulerInterface):
     def make_spec_decoding_stats(
         self,
         spec_decoding_stats: SpecDecodingStats | None,
-        num_draft_tokens: int,
+        num_physical_draft_tokens: int,
         num_accepted_tokens: int,
         num_invalid_spec_tokens: dict[str, int] | None,
         request_id: str,
     ) -> SpecDecodingStats | None:
-        if not self.log_stats or not num_draft_tokens:
+        if not self.log_stats or not num_physical_draft_tokens:
             return None
+        num_padding_tokens = (
+            num_invalid_spec_tokens.get(request_id, 0)
+            if num_invalid_spec_tokens
+            else 0
+        )
+        assert 0 <= num_padding_tokens <= num_physical_draft_tokens
+        num_valid_draft_tokens = num_physical_draft_tokens - num_padding_tokens
+        assert 0 <= num_accepted_tokens <= num_valid_draft_tokens
+        if not num_valid_draft_tokens:
+            # A full-padding frame contains no logical draft round.
+            return spec_decoding_stats
         if spec_decoding_stats is None:
             spec_decoding_stats = SpecDecodingStats.new(self.num_spec_tokens)
-        if num_invalid_spec_tokens:
-            num_draft_tokens -= num_invalid_spec_tokens.get(request_id, 0)
         spec_decoding_stats.observe_draft(
-            num_draft_tokens=num_draft_tokens, num_accepted_tokens=num_accepted_tokens
+            num_draft_tokens=num_valid_draft_tokens,
+            num_accepted_tokens=num_accepted_tokens,
         )
         return spec_decoding_stats
 

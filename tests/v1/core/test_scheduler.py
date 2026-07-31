@@ -1063,7 +1063,7 @@ def test_no_spec_tokens_scheduled_for_prefill_chunks():
 def _model_output(scheduler, output, sampled):
     """Feed `sampled` (per-request list) back to the scheduler."""
     req_ids = list(output.num_scheduled_tokens.keys())
-    scheduler.update_from_output(
+    return scheduler.update_from_output(
         output,
         ModelRunnerOutput(
             req_ids=req_ids,
@@ -1111,6 +1111,74 @@ def test_spec_decode_padding_first_decode_step():
     # r2 is padded to the 1 + num_spec shape with placeholder (-1) drafts.
     assert out.num_scheduled_tokens[r2.request_id] == 1 + num_spec
     assert out.scheduled_spec_decode_tokens[r2.request_id] == [-1] * num_spec
+    assert out.num_invalid_spec_tokens == {r2.request_id: num_spec}
+
+    # Simulate grammar validation shortening r1's real draft to one token.
+    # Its tail padding must merge with (not overwrite) r2's graph padding.
+    scheduler.update_draft_token_ids_in_output(
+        DraftTokenIds([r1.request_id], [[1]]),
+        out,
+    )
+    assert out.scheduled_spec_decode_tokens[r1.request_id] == [1, -1, -1]
+    assert out.num_invalid_spec_tokens == {
+        r1.request_id: 2,
+        r2.request_id: num_spec,
+    }
+
+    # A complete frame for r2 replaces its graph padding, so the stale invalid
+    # count must be removed without disturbing r1's partial-padding record.
+    scheduler.update_draft_token_ids_in_output(
+        DraftTokenIds([r2.request_id], [[10, 11, 12]]),
+        out,
+    )
+    assert out.scheduled_spec_decode_tokens[r2.request_id] == [10, 11, 12]
+    assert out.num_invalid_spec_tokens == {r1.request_id: 2}
+
+    # Padding still executes for r1, but metrics observe only its one real
+    # draft token plus r2's complete three-token draft.
+    engine_core_outputs = _model_output(
+        scheduler,
+        out,
+        [[1, 4], [10, 11, 12, 13]],
+    )
+    stats = engine_core_outputs[0].scheduler_stats.spec_decoding_stats
+    assert stats is not None
+    assert stats.num_drafts == 2
+    assert stats.num_draft_tokens == 4
+    assert stats.num_accepted_tokens == 4
+    assert stats.num_accepted_tokens_per_pos == [2, 1, 1]
+    assert stats.num_draft_tokens_per_pos == [2, 1, 1]
+
+
+def test_spec_decode_full_padding_excluded_from_stats():
+    """A full scheduler-padding frame does not count as a draft round."""
+    num_spec = 3
+    scheduler = create_scheduler(
+        num_speculative_tokens=num_spec,
+        enable_prefix_caching=True,
+        block_size=16,
+    )
+    r1, r2 = create_requests(
+        num_requests=2, num_tokens=33, same_prompt=True, max_tokens=16
+    )
+
+    scheduler.add_request(r1)
+    out = scheduler.schedule()
+    _model_output(scheduler, out, [[100]])
+
+    scheduler.add_request(r2)
+    out = scheduler.schedule()
+    assert out.num_scheduled_tokens[r2.request_id] == 1 + num_spec
+    assert out.scheduled_spec_decode_tokens[r2.request_id] == [-1] * num_spec
+    assert out.num_invalid_spec_tokens == {r2.request_id: num_spec}
+
+    req_ids = list(out.num_scheduled_tokens)
+    engine_core_outputs = _model_output(
+        scheduler,
+        out,
+        [[1000 + i] for i in range(len(req_ids))],
+    )
+    assert engine_core_outputs[0].scheduler_stats.spec_decoding_stats is None
 
 
 def test_spec_decode_padding_skipped_with_prefill_in_batch():
