@@ -254,6 +254,93 @@ def test_select_common_block_size_uses_largest_shared_int():
 
 @pytest.mark.skip_global_cleanup
 @pytest.mark.parametrize(
+    ("max_tokens", "discard", "expected"),
+    [
+        (1, False, False),
+        (2, False, True),
+        (None, False, True),
+        (2, True, False),
+    ],
+)
+def test_needs_pp_sampled_token_frame(
+    max_tokens: int | None,
+    discard: bool,
+    expected: bool,
+):
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.input_batch = SimpleNamespace(num_reqs=1, req_ids=["req-0"])
+    runner.discard_request_mask = SimpleNamespace(np=np.array([discard]))
+    runner.requests = {
+        "req-0": SimpleNamespace(
+            num_prompt_tokens=3,
+            sampling_params=SimpleNamespace(max_tokens=max_tokens),
+        )
+    }
+
+    assert runner._needs_pp_sampled_token_frame() is expected
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize(("max_tokens", "expected_calls"), [(1, 0), (2, 2)])
+def test_pp_mtp_broadcast_skips_terminal_output(
+    monkeypatch: pytest.MonkeyPatch,
+    max_tokens: int,
+    expected_calls: int,
+):
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.input_batch = SimpleNamespace(num_reqs=1, req_ids=["req-0"])
+    runner.discard_request_mask = SimpleNamespace(np=np.array([False]))
+    runner.requests = {
+        "req-0": SimpleNamespace(
+            num_prompt_tokens=3,
+            num_computed_tokens=0,
+            sampling_params=SimpleNamespace(max_tokens=max_tokens),
+        )
+    }
+    runner.num_spec_tokens = 2
+    runner._draft_token_ids = torch.zeros((1, 2), dtype=torch.int32)
+    pp = SimpleNamespace(is_last_rank=True, rank=1, device_group=object())
+    monkeypatch.setattr(gpu_model_runner_module, "get_pp_group", lambda: pp)
+    broadcast = Mock()
+    monkeypatch.setattr(torch.distributed, "broadcast", broadcast)
+
+    runner._pp_broadcast_prev_sampled_token_ids(
+        torch.zeros((1, 3), dtype=torch.int32)
+    )
+    runner._pp_broadcast_draft_token_ids()
+
+    assert broadcast.call_count == expected_calls
+
+
+@pytest.mark.skip_global_cleanup
+def test_pp_mtp_receive_skips_terminal_output(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.input_batch = SimpleNamespace(num_reqs=1, req_ids=["req-0"])
+    runner.discard_request_mask = SimpleNamespace(np=np.array([False]))
+    runner.requests = {
+        "req-0": SimpleNamespace(
+            num_prompt_tokens=3,
+            num_computed_tokens=0,
+            sampling_params=SimpleNamespace(max_tokens=1),
+        )
+    }
+    runner.num_spec_tokens = 2
+    pp = SimpleNamespace(is_last_rank=False, last_rank=1, device_group=object())
+    monkeypatch.setattr(gpu_model_runner_module, "get_pp_group", lambda: pp)
+    broadcast = Mock()
+    monkeypatch.setattr(torch.distributed, "broadcast", broadcast)
+
+    runner._pp_receive_prev_sampled_token_ids_to_input_batch()
+
+    assert broadcast.call_count == 0
+    assert runner.input_batch.prev_sampled_token_ids is None
+    assert runner.input_batch.prev_req_id_to_index == {}
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize(
     ("world_size", "is_last_rank", "expected_calls"),
     [(1, True, 0), (2, True, 0), (2, False, 1)],
 )

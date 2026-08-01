@@ -4074,6 +4074,21 @@ class GPUModelRunner(
         num_reqs = self.input_batch.num_reqs
         return bool(self.discard_request_mask.np[:num_reqs].all())
 
+    def _needs_pp_sampled_token_frame(self) -> bool:
+        """Return whether this batch always uses direct PP frame handoff."""
+        num_reqs = self.input_batch.num_reqs
+        discard_mask = self.discard_request_mask.np[:num_reqs]
+        for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+            if discard_mask[i]:
+                continue
+            req_state = self.requests[req_id]
+            sampling_params = req_state.sampling_params
+            if sampling_params is None:
+                continue
+            if sampling_params.max_tokens is None or sampling_params.max_tokens > 1:
+                return True
+        return False
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -4731,8 +4746,12 @@ class GPUModelRunner(
         pp = get_pp_group()
         assert pp.is_last_rank
         # Skip for chunked prefill: sampled tokens are dummy
-        # and will be discarded, no need to broadcast.
-        if self._is_all_reqs_chunked_prefill():
+        # and will be discarded. Also skip terminal outputs because no later
+        # local step can consume the sampled/draft frame.
+        if (
+            self._is_all_reqs_chunked_prefill()
+            or not self._needs_pp_sampled_token_frame()
+        ):
             return
 
         width = self.num_spec_tokens + 1
@@ -4754,7 +4773,10 @@ class GPUModelRunner(
     def _pp_broadcast_draft_token_ids(self) -> None:
         pp = get_pp_group()
         assert pp.is_last_rank
-        if self._is_all_reqs_chunked_prefill():
+        if (
+            self._is_all_reqs_chunked_prefill()
+            or not self._needs_pp_sampled_token_frame()
+        ):
             return
         if not torch.is_tensor(self._draft_token_ids):
             raise RuntimeError("Missing draft-token frame on the last PP rank")
@@ -4785,6 +4807,14 @@ class GPUModelRunner(
         discard_req_indices = np.nonzero(self.discard_request_mask.np[:num_reqs])[0]
         discard_req_indices_set = set(discard_req_indices)
         prev_req_id_to_index: dict[str, int] = {}
+
+        if (
+            not self._is_all_reqs_chunked_prefill()
+            and not self._needs_pp_sampled_token_frame()
+        ):
+            self.input_batch.prev_sampled_token_ids = None
+            self.input_batch.prev_req_id_to_index = {}
+            return
 
         if not self.num_spec_tokens:
             recv = torch.empty((num_reqs, 1), dtype=torch.int32, device=self.device)
