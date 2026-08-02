@@ -14,6 +14,20 @@ from typing import Any
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from starlette.background import BackgroundTask
+
+
+COMPLETION_ENDPOINTS = {"/v1/completions", "/v1/chat/completions"}
+HOP_BY_HOP_HEADERS = {
+    b"connection",
+    b"keep-alive",
+    b"proxy-authenticate",
+    b"proxy-authorization",
+    b"te",
+    b"trailer",
+    b"transfer-encoding",
+    b"upgrade",
+}
 
 
 def maybe_wrap_ipv6_address(address: str) -> str:
@@ -135,12 +149,57 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
+@app.middleware("http")
+async def proxy_to_single_decoder(request: Request, call_next):
+    is_completion_request = (
+        request.method == "POST" and request.url.path in COMPLETION_ENDPOINTS
+    )
+    if len(request.app.state.decode_clients) != 1 or is_completion_request:
+        return await call_next(request)
+
+    decode_client = request.app.state.decode_clients[0]["client"]
+    endpoint = request.url.path
+    if request.url.query:
+        endpoint += f"?{request.url.query}"
+
+    headers = [
+        (name, value)
+        for name, value in request.headers.raw
+        if name.lower() not in HOP_BY_HOP_HEADERS and name.lower() != b"host"
+    ]
+    upstream_request = decode_client.build_request(
+        request.method,
+        endpoint,
+        headers=headers,
+        content=request.stream(),
+    )
+    upstream_response = await decode_client.send(upstream_request, stream=True)
+
+    response = StreamingResponse(
+        upstream_response.aiter_raw(),
+        status_code=upstream_response.status_code,
+        background=BackgroundTask(upstream_response.aclose),
+    )
+    response.raw_headers = [
+        (name, value)
+        for name, value in upstream_response.headers.raw
+        if name.lower() not in HOP_BY_HOP_HEADERS
+    ]
+    return response
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--port", type=int, default=8000)
     # Always use 127.0.0.1 as localhost binds to IPv6 which is blocked on CI
     parser.add_argument("--host", type=str, default="127.0.0.1")
+    parser.add_argument(
+        "--mode",
+        choices=("sequential", "concurrent"),
+        default="sequential",
+        help="Run prefill and decode sequentially or concurrently.",
+    )
 
     # For prefiller instances
     parser.add_argument(
@@ -248,17 +307,24 @@ def get_next_client(app, service_type: str):
 
 
 async def send_request_to_service(
-    client_info: dict, dp_rank: int, endpoint: str, req_data: dict, request_id: str
-):
+    client_info: dict,
+    dp_rank: int,
+    endpoint: str,
+    req_data: dict,
+    request_id: str,
+    mode: str,
+) -> Any | None:
     """
     Send a request to a service using a client from the pool.
     """
     req_data = req_data.copy()
-    req_data["kv_transfer_params"] = {
+    kv_transfer_params: dict[str, Any] = {
         "do_remote_decode": True,
         "do_remote_prefill": False,
-        "transfer_id": f"xfer-{request_id}",
     }
+    if mode == "concurrent":
+        kv_transfer_params["transfer_id"] = f"xfer-{request_id}"
+    req_data["kv_transfer_params"] = kv_transfer_params
     req_data["stream"] = False
     req_data["max_tokens"] = 1
     if "max_completion_tokens" in req_data:
@@ -268,16 +334,21 @@ async def send_request_to_service(
     headers = {
         "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
         "X-Request-Id": request_id,
-        "X-data-parallel-rank": str(dp_rank),
     }
+    if mode == "concurrent":
+        headers["X-data-parallel-rank"] = str(dp_rank)
 
     response = await client_info["client"].post(
         endpoint, json=req_data, headers=headers
     )
-    response.raise_for_status()
-
-    # CRITICAL: Release connection back to pool
-    await response.aclose()
+    try:
+        response.raise_for_status()
+        if mode == "sequential":
+            return response.json()["kv_transfer_params"]
+        return None
+    finally:
+        # CRITICAL: Release connection back to pool
+        await response.aclose()
 
 
 async def stream_service_response(
@@ -287,6 +358,8 @@ async def stream_service_response(
     endpoint: str,
     req_data: dict,
     request_id: str,
+    mode: str,
+    kv_transfer_params: Any | None,
 ):
     """
     Asynchronously stream response from a service using a client from the pool.
@@ -296,13 +369,16 @@ async def stream_service_response(
         "X-Request-Id": request_id,
     }
 
-    req_data["kv_transfer_params"] = {
-        "do_remote_decode": False,
-        "do_remote_prefill": True,
-        "remote_bootstrap_addr": prefill_client_info["bootstrap_addr"],
-        "remote_engine_id": prefill_client_info["dp_engine_id"][prefill_dp_rank],
-        "transfer_id": f"xfer-{request_id}",
-    }
+    if mode == "sequential":
+        req_data["kv_transfer_params"] = kv_transfer_params
+    else:
+        req_data["kv_transfer_params"] = {
+            "do_remote_decode": False,
+            "do_remote_prefill": True,
+            "remote_bootstrap_addr": prefill_client_info["bootstrap_addr"],
+            "remote_engine_id": prefill_client_info["dp_engine_id"][prefill_dp_rank],
+            "transfer_id": f"xfer-{request_id}",
+        }
 
     async with decode_client_info["client"].stream(
         "POST", endpoint, json=req_data, headers=headers
@@ -324,11 +400,27 @@ async def _handle_completions(api: str, request: Request):
         prefill_client_info, prefill_dp_rank = get_next_client(request.app, "prefill")
 
         # Send request to prefill service
-        asyncio.create_task(
-            send_request_to_service(
-                prefill_client_info, prefill_dp_rank, api, req_data, request_id
+        kv_transfer_params = None
+        if global_args.mode == "sequential":
+            kv_transfer_params = await send_request_to_service(
+                prefill_client_info,
+                prefill_dp_rank,
+                api,
+                req_data,
+                request_id,
+                global_args.mode,
             )
-        )
+        else:
+            asyncio.create_task(
+                send_request_to_service(
+                    prefill_client_info,
+                    prefill_dp_rank,
+                    api,
+                    req_data,
+                    request_id,
+                    global_args.mode,
+                )
+            )
 
         decode_client_info = get_next_client(request.app, "decode")
 
@@ -341,6 +433,8 @@ async def _handle_completions(api: str, request: Request):
                 api,
                 req_data,
                 request_id=request_id,
+                mode=global_args.mode,
+                kv_transfer_params=kv_transfer_params,
             ):
                 yield chunk
 
