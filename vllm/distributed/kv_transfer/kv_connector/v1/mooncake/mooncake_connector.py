@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import ipaddress
 import logging
 import threading
 import time
@@ -968,6 +969,7 @@ class MooncakeConnectorScheduler:
     ):
         self.vllm_config = vllm_config
         self.block_size = vllm_config.cache_config.block_size
+        self.engine_id = engine_id
 
         assert vllm_config.kv_transfer_config
         self.is_kv_producer: bool = (
@@ -976,6 +978,9 @@ class MooncakeConnectorScheduler:
         self.is_kv_consumer: bool = (
             vllm_config.kv_transfer_config.kv_role == "kv_consumer"
         )
+        if not self.is_kv_consumer:
+            host, port = get_mooncake_remote_bootstrap_addr(self.vllm_config)
+            self.bootstrap_addr = make_zmq_path("http", host, port)
         logger.info("Initializing Mooncake Transfer Engine Scheduler %s", engine_id)
 
         self._is_hma_required = (
@@ -1166,6 +1171,7 @@ class MooncakeConnectorScheduler:
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
+        self._set_default_transfer_id_if_missing(request)
         params = request.kv_transfer_params
         logger.debug(
             "MooncakeConnector update_state_after_alloc: "
@@ -1256,6 +1262,7 @@ class MooncakeConnectorScheduler:
         if not self.is_kv_consumer:
             for req_id, (req, block_ids) in self._reqs_need_send.items():
                 assert req.kv_transfer_params is not None
+                self._set_default_transfer_id_if_missing(req)
                 meta.add_new_req(
                     request_id=req_id,
                     local_block_ids=block_ids,
@@ -1278,6 +1285,7 @@ class MooncakeConnectorScheduler:
         should be freed now or will be sent asynchronously and freed later.
         """
 
+        self._set_default_transfer_id_if_missing(request)
         params = request.kv_transfer_params
         logger.debug(
             "MooncakeConnector request_finished, req_id=%s, request_status=%s, "
@@ -1326,7 +1334,25 @@ class MooncakeConnectorScheduler:
                 ),
             )
 
-        return delay_free_blocks, None
+        return delay_free_blocks, {
+            "do_remote_decode": False,
+            "do_remote_prefill": True,
+            "remote_bootstrap_addr": self.bootstrap_addr,
+            "remote_engine_id": self.engine_id,
+            "transfer_id": params["transfer_id"],
+        }
+
+    def _set_default_transfer_id_if_missing(self, request: "Request") -> None:
+        """Set a default transfer_id in the request's kv_transfer_params if it
+        is missing."""
+        if not self.is_kv_producer:
+            # If this is a consumer, we expect the transfer_id to be set by the
+            # producer.
+            return
+
+        params = request.kv_transfer_params
+        if params and not params.get("transfer_id"):
+            params["transfer_id"] = f"xfer-{request.request_id}"
 
 
 class MooncakeConnectorWorker:
@@ -2960,3 +2986,29 @@ def get_mooncake_bootstrap_addr(vllm_config: VllmConfig) -> tuple[str, int]:
         host = parallel_config.data_parallel_master_ip
     port = envs.VLLM_MOONCAKE_BOOTSTRAP_PORT
     return (host, port)
+
+
+def get_mooncake_remote_bootstrap_addr(
+    vllm_config: VllmConfig,
+) -> tuple[str, int]:
+    """Return the remotely reachable bootstrap address advertised to decoders."""
+
+    def is_local_only(host: str) -> bool:
+        normalized_host = host.rstrip(".").lower()
+        try:
+            ip = ipaddress.ip_address(normalized_host)
+        except ValueError:
+            return normalized_host.split(".", 1)[0] == "localhost"
+        return ip.is_loopback or ip.is_unspecified
+
+    host, port = get_mooncake_bootstrap_addr(vllm_config)
+    if is_local_only(host):
+        host = get_ip()
+    if is_local_only(host):
+        raise ValueError(
+            "Mooncake bootstrap server must advertise a remotely reachable host, "
+            f"but got {host!r}. Set --master-addr/--data-parallel-address for "
+            "a multi-node instance or VLLM_HOST_IP for a single-node instance."
+        )
+
+    return host, port

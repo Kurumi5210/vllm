@@ -11,6 +11,7 @@ import pytest
 import torch
 import zmq.asyncio
 
+from vllm import envs
 from vllm.config import set_current_vllm_config
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import (
     KVConnectorRole,
@@ -24,6 +25,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     PullReqMeta,
     SendBlockMeta,
     TransferRegion,
+    get_mooncake_remote_bootstrap_addr,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import (
     MooncakeBootstrapServer,
@@ -313,6 +315,67 @@ async def test_bootstrap_server(bootstrap_server: MooncakeBootstrapServer):
         assert "Engine ID mismatch" in response.text
 
 
+def _make_bootstrap_vllm_config(
+    *,
+    local_engines_only: bool = False,
+    data_parallel_rank_local: int = 0,
+    data_parallel_index: int = 0,
+    nnodes_within_dp: int = 1,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            local_engines_only=local_engines_only,
+            data_parallel_rank_local=data_parallel_rank_local,
+            data_parallel_index=data_parallel_index,
+            nnodes_within_dp=nnodes_within_dp,
+            master_addr="model-parallel-master",
+            data_parallel_master_ip="data-parallel-master",
+        )
+    )
+
+
+def test_get_mooncake_remote_bootstrap_addr_preserves_nonlocal_host():
+    vllm_config = _make_bootstrap_vllm_config(nnodes_within_dp=2)
+
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+        "mooncake_connector.get_ip"
+    ) as mock_get_ip:
+        assert get_mooncake_remote_bootstrap_addr(vllm_config) == (
+            "model-parallel-master",
+            envs.VLLM_MOONCAKE_BOOTSTRAP_PORT,
+        )
+        mock_get_ip.assert_not_called()
+
+
+def test_get_mooncake_remote_bootstrap_addr_replaces_local_host():
+    vllm_config = _make_bootstrap_vllm_config(local_engines_only=True)
+
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+        "mooncake_connector.get_ip",
+        return_value="prefill-host",
+    ):
+        assert get_mooncake_remote_bootstrap_addr(vllm_config) == (
+            "prefill-host",
+            envs.VLLM_MOONCAKE_BOOTSTRAP_PORT,
+        )
+
+
+def test_get_mooncake_remote_bootstrap_addr_rejects_local_only_host():
+    vllm_config = _make_bootstrap_vllm_config(local_engines_only=True)
+
+    with (
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_connector.get_ip",
+            return_value="localhost",
+        ),
+        pytest.raises(ValueError, match="remotely reachable host"),
+    ):
+        get_mooncake_remote_bootstrap_addr(vllm_config)
+
+
 def test_scheduler_request_finished():
     """
     Tests the scheduler-side logic when a request finishes.
@@ -332,8 +395,17 @@ def test_scheduler_request_finished():
 
     # Case: Capped length (Successful prefill, need to send to decoder)
     request.status = RequestStatus.FINISHED_LENGTH_CAPPED
-    delay_free, _ = scheduler_connector.request_finished(request, block_ids=([10, 11],))
+    delay_free, kv_transfer_params = scheduler_connector.request_finished(
+        request, block_ids=([10, 11],)
+    )
     assert delay_free is True
+    assert kv_transfer_params == {
+        "do_remote_decode": False,
+        "do_remote_prefill": True,
+        "remote_bootstrap_addr": scheduler_connector.bootstrap_addr,
+        "remote_engine_id": scheduler_connector.engine_id,
+        "transfer_id": request.request_id,
+    }
     assert "id-1" in scheduler_connector._reqs_need_send
     assert scheduler_connector._reqs_need_send["id-1"][1] == [[10, 11]]
 
