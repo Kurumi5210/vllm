@@ -256,8 +256,7 @@ class Scheduler(SchedulerInterface):
         self.pp_mtp_broadcast = (
             self.use_pp
             and self.num_spec_tokens > 0
-            and self.parallel_config.distributed_executor_backend
-            != "external_launcher"
+            and self.parallel_config.distributed_executor_backend != "external_launcher"
         )
         self.sync_pp_spec = (
             self.use_pp
@@ -1862,9 +1861,7 @@ class Scheduler(SchedulerInterface):
     def update_draft_token_ids_in_output(
         self, draft_token_ids: DraftTokenIds, scheduler_output: SchedulerOutput
     ) -> None:
-        num_invalid_spec_tokens = dict(
-            scheduler_output.num_invalid_spec_tokens or {}
-        )
+        num_invalid_spec_tokens = dict(scheduler_output.num_invalid_spec_tokens or {})
 
         sched_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
         for req_id, spec_token_ids in zip(
@@ -2179,9 +2176,7 @@ class Scheduler(SchedulerInterface):
         if not self.log_stats or not num_physical_draft_tokens:
             return None
         num_padding_tokens = (
-            num_invalid_spec_tokens.get(request_id, 0)
-            if num_invalid_spec_tokens
-            else 0
+            num_invalid_spec_tokens.get(request_id, 0) if num_invalid_spec_tokens else 0
         )
         assert 0 <= num_padding_tokens <= num_physical_draft_tokens
         num_valid_draft_tokens = num_physical_draft_tokens - num_padding_tokens

@@ -304,9 +304,7 @@ def test_pp_mtp_broadcast_skips_terminal_output(
     broadcast = Mock()
     monkeypatch.setattr(torch.distributed, "broadcast", broadcast)
 
-    runner._pp_broadcast_prev_sampled_token_ids(
-        torch.zeros((1, 3), dtype=torch.int32)
-    )
+    runner._pp_broadcast_prev_sampled_token_ids(torch.zeros((1, 3), dtype=torch.int32))
     runner._pp_broadcast_draft_token_ids()
 
     assert broadcast.call_count == expected_calls

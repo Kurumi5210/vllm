@@ -16,7 +16,6 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from starlette.background import BackgroundTask
 
-
 COMPLETION_ENDPOINTS = {"/v1/completions", "/v1/chat/completions"}
 HOP_BY_HOP_HEADERS = {
     b"connection",

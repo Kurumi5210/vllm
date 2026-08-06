@@ -1430,9 +1430,8 @@ class GPUModelRunner(
                 # The request was either preempted and resumed later, or was not
                 # scheduled in the previous step and needs to be added again.
 
-                if (
-                    num_output_tokens > 0
-                    and (self.use_async_scheduling or not is_last_rank)
+                if num_output_tokens > 0 and (
+                    self.use_async_scheduling or not is_last_rank
                 ):
                     # We must recover the output token ids for resumed requests in the
                     # async scheduling case, so that correct input_ids are obtained.
@@ -4478,9 +4477,8 @@ class GPUModelRunner(
             # Receive the previous sampled/draft frame from the last PP rank
             # whenever direct PP transport is active.
             if (
-                (self.use_async_scheduling or self.use_pp_mtp_broadcast)
-                and not get_pp_group().is_last_rank
-            ):
+                self.use_async_scheduling or self.use_pp_mtp_broadcast
+            ) and not get_pp_group().is_last_rank:
                 self._pp_receive_prev_sampled_token_ids_to_input_batch()
             # In case of PP with kv transfer, we need to pass through the
             # kv_connector_output
@@ -4795,9 +4793,7 @@ class GPUModelRunner(
         draft_token_ids = draft_token_ids[
             : expected_shape[0], : expected_shape[1]
         ].contiguous()
-        torch.distributed.broadcast(
-            draft_token_ids, src=pp.rank, group=pp.device_group
-        )
+        torch.distributed.broadcast(draft_token_ids, src=pp.rank, group=pp.device_group)
 
     def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
         """Receive sampled token ids broadcast from last PP stage"""
@@ -4843,9 +4839,7 @@ class GPUModelRunner(
             self.input_batch.prev_req_id_to_index = {}
             return
 
-        recv = torch.empty(
-            (num_reqs, width), dtype=torch.int32, device=self.device
-        )
+        recv = torch.empty((num_reqs, width), dtype=torch.int32, device=self.device)
         torch.distributed.broadcast(recv, src=pp.last_rank, group=pp.device_group)
         draft_token_ids = torch.empty(
             (num_reqs, self.num_spec_tokens),

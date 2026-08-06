@@ -250,9 +250,7 @@ class Executor(ABC):
         self.collective_rpc("execute_dummy_batch")
 
     def take_draft_token_ids(self, non_block: bool = False) -> DraftTokenIds | None:
-        output = self.collective_rpc(
-            "take_draft_token_ids", non_block=non_block
-        )
+        output = self.collective_rpc("take_draft_token_ids", non_block=non_block)
         if non_block:
             first_result_future: Future[DraftTokenIds | None] = Future()
 

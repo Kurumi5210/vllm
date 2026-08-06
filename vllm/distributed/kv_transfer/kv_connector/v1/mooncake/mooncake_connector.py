@@ -6,10 +6,11 @@ import logging
 import threading
 import time
 from collections import defaultdict
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import msgspec
@@ -59,7 +60,6 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
-    SlidingWindowSpec,
 )
 from vllm.v1.request import RequestStatus
 from vllm.v1.worker.block_table import BlockTable
@@ -713,9 +713,7 @@ class MooncakeXferMetadata(
     kv_caches_base_addr: list[int]
     block_lens: list[int]
     kv_block_lens: list[int]
-    req_token_ranges: dict[ReqId, tuple[int, int]] = msgspec.field(
-        default_factory=dict
-    )
+    req_token_ranges: dict[ReqId, tuple[int, int]] = msgspec.field(default_factory=dict)
     registered_layer_names: list[str] = msgspec.field(default_factory=list)
     registered_layer_indices: list[int] = msgspec.field(default_factory=list)
     registered_group_indices: list[int] = msgspec.field(default_factory=list)
@@ -2140,10 +2138,14 @@ class MooncakeConnectorWorker:
                 )
                 group_block_slicer = None
                 if has_remote_token_range:
+
                     def group_block_slicer(
                         group_idx: int,
                         local_group: list[int],
                         remote_group: list[int],
+                        local_region: TransferRegion = local_region,
+                        remote_region: TransferRegion = remote_region,
+                        remote_token_range: tuple[int, int] = remote_token_range,
                     ) -> tuple[list[int], list[int]]:
                         return self._clip_transfer_blocks_for_region(
                             local_group,
