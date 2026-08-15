@@ -295,6 +295,8 @@ if TYPE_CHECKING:
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
     VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None = None
+    VLLM_USE_FORCE_LOAD_BLANCE: bool = False
+    VLLM_IGNORE_TENSOR_PLACEHOLDER: bool = False
 
 
 def get_default_cache_root():
@@ -2018,6 +2020,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Each entry is VAR_NAME or VAR_NAME:<suffix> (suffix appended to
     # RDMA device name). Must be set together with VLLM_GPU_NIC_PCIE_MAPPING.
     "VLLM_NIC_SELECTION_VARS": lambda: os.getenv("VLLM_NIC_SELECTION_VARS", ""),
+    # Benchmarking knob: replace the router's expert choice with a uniformly
+    # random one so every expert receives roughly the same number of tokens.
+    # Produces garbage output; only useful for measuring MoE dispatch cost
+    # without router skew.
+    "VLLM_USE_FORCE_LOAD_BLANCE": lambda: bool(
+        int(os.getenv("VLLM_USE_FORCE_LOAD_BLANCE", "0"))
+    ),
+    # Skip the worst-case prefill workspace allocation MLA makes during the
+    # profile run. Decode-only instances never run that path, so the
+    # placeholder only inflates the measured peak memory.
+    "VLLM_IGNORE_TENSOR_PLACEHOLDER": lambda: bool(
+        int(os.getenv("VLLM_IGNORE_TENSOR_PLACEHOLDER", "0"))
+    ),
 }
 
 
