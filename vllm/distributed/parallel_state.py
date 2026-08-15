@@ -1426,6 +1426,68 @@ def get_pcp_group() -> GroupCoordinator:
     return _PCP
 
 
+# Fine-grained (per-module) tensor parallel groups. Each is carved out of the
+# data parallel axis; see `FineGrainedTPConfig` and `_build_fine_grained_tp_ranks`.
+_OTP: GroupCoordinator | None = None
+_LMTP: GroupCoordinator | None = None
+_EMBED_TP: GroupCoordinator | None = None
+_MLP_TP: GroupCoordinator | None = None
+
+
+def get_otp_group() -> GroupCoordinator:
+    assert _OTP is not None, (
+        "output projection tensor parallel group is not initialized"
+    )
+    return _OTP
+
+
+def get_lmhead_tp_group() -> GroupCoordinator:
+    assert _LMTP is not None, "lm head tensor parallel group is not initialized"
+    return _LMTP
+
+
+def get_embed_tp_group() -> GroupCoordinator:
+    assert _EMBED_TP is not None, "embedding tensor parallel group is not initialized"
+    return _EMBED_TP
+
+
+def get_mlp_tp_group() -> GroupCoordinator:
+    assert _MLP_TP is not None, "mlp tensor parallel group is not initialized"
+    return _MLP_TP
+
+
+def is_otp_initialized() -> bool:
+    return _OTP is not None
+
+
+def is_lmhead_tp_initialized() -> bool:
+    return _LMTP is not None
+
+
+def is_embed_tp_initialized() -> bool:
+    return _EMBED_TP is not None
+
+
+def _build_fine_grained_tp_ranks(
+    all_ranks: torch.Tensor, data_parallel_size: int, group_size: int
+) -> list[list[int]]:
+    """Partition the data parallel axis into groups of `group_size` ranks.
+
+    `all_ranks` is the `ExternalDP x DP x PP x PCP x TP` grid built by
+    `initialize_model_parallel`. Ranks land in the same group when they agree on
+    every other axis and their DP index falls in the same chunk of `group_size`,
+    i.e. each full DP group is sliced into `data_parallel_size // group_size`
+    consecutive pieces.
+    """
+    if data_parallel_size % group_size != 0:
+        raise ValueError(
+            f"fine-grained tensor parallel size {group_size} must divide "
+            f"data_parallel_size {data_parallel_size}"
+        )
+    dp_rows = all_ranks.transpose(1, 4).reshape(-1, data_parallel_size)
+    return [chunk.tolist() for row in dp_rows for chunk in row.split(group_size)]
+
+
 @contextmanager
 def graph_capture(
     device: torch.device,
@@ -1943,6 +2005,48 @@ def initialize_model_parallel(
     # If no EP group needed, _EP remains None
     # If no EPLB group needed, _EPLB remains None
 
+    # Build the fine-grained (per-module) tensor parallel groups: o_proj,
+    # lm_head, embed_tokens and MLP each get their own slice of the DP axis.
+    # Sizes that are equal share one GroupCoordinator instead of creating
+    # redundant NCCL communicators over identical rank sets.
+    global _OTP, _LMTP, _EMBED_TP, _MLP_TP
+    fine_grained_tp_config = config.fine_grained_tp_config
+    if fine_grained_tp_config.enabled:
+        if enable_elastic_ep:
+            raise NotImplementedError(
+                "fine-grained tensor parallel is not supported with elastic EP"
+            )
+        groups_by_size: dict[int, GroupCoordinator] = {}
+
+        def get_fine_grained_tp_group(
+            group_size: int, group_name: str
+        ) -> GroupCoordinator | None:
+            if group_size <= 1:
+                return None
+            if group_size not in groups_by_size:
+                groups_by_size[group_size] = init_model_parallel_group(
+                    _build_fine_grained_tp_ranks(
+                        all_ranks, data_parallel_size, group_size
+                    ),
+                    get_world_group().local_rank,
+                    backend,
+                    group_name=group_name,
+                )
+            return groups_by_size[group_size]
+
+        _OTP = get_fine_grained_tp_group(
+            fine_grained_tp_config.oproj_tensor_parallel_size, "otp"
+        )
+        _LMTP = get_fine_grained_tp_group(
+            fine_grained_tp_config.lmhead_tensor_parallel_size, "lmheadtp"
+        )
+        _EMBED_TP = get_fine_grained_tp_group(
+            fine_grained_tp_config.embedding_tensor_parallel_size, "embedtp"
+        )
+        _MLP_TP = get_fine_grained_tp_group(
+            fine_grained_tp_config.mlp_tensor_parallel_size, "mlptp"
+        )
+
     logger.info_once(
         "rank %s in world size %s is assigned as "
         "DP rank %s, PP rank %s, PCP rank %s, "
@@ -2092,6 +2196,13 @@ def destroy_model_parallel():
     if _EPLB:
         _EPLB.destroy()
     _EPLB = None
+
+    global _OTP, _LMTP, _EMBED_TP, _MLP_TP
+    # Equal-sized fine-grained groups share one coordinator, so destroy each
+    # distinct object only once.
+    for group in {id(g): g for g in (_OTP, _LMTP, _EMBED_TP, _MLP_TP) if g}.values():
+        group.destroy()
+    _OTP = _LMTP = _EMBED_TP = _MLP_TP = None
 
 
 def destroy_distributed_environment():

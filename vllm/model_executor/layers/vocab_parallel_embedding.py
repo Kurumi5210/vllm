@@ -11,9 +11,12 @@ from torch.nn.parameter import Parameter
 import vllm.envs as envs
 from vllm.distributed import (
     divide,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
+)
+from vllm.distributed.parallel_state import (
+    get_embed_tp_group,
+    get_lmhead_tp_group,
+    get_tp_group,
 )
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.batch_invariant import (
@@ -24,7 +27,11 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
     method_has_implemented_embedding,
 )
-from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
+from vllm.model_executor.layers.utils import (
+    dispatch_unquantized_gemm,
+    get_fine_grained_tp_config,
+    get_fine_grained_tp_num_rows,
+)
 from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
@@ -249,8 +256,28 @@ class VocabParallelEmbedding(PluggableLayer):
         super().__init__()
 
         # Keep the input dimensions.
-        tp_rank = get_tensor_model_parallel_rank()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        # The vocab may be sharded over a fine-grained group carved out of the DP
+        # axis instead of the global TP group. `use_lmhead_tp`/`use_embedding_tp`
+        # let the forward paths (here and in `LogitsProcessor`) agree on which
+        # group this layer's weight was actually sharded over.
+        fine_grained_tp_config = get_fine_grained_tp_config()
+        self.use_lmhead_tp = (
+            fine_grained_tp_config.lmhead_tensor_parallel_size > 1
+            and "lm_head" in prefix
+        )
+        self.use_embedding_tp = (
+            fine_grained_tp_config.embedding_tensor_parallel_size > 1
+            and "embed_tokens" in prefix
+        )
+        if self.use_lmhead_tp:
+            self.comm_group = get_lmhead_tp_group()
+        elif self.use_embedding_tp:
+            self.comm_group = get_embed_tp_group()
+        else:
+            self.comm_group = get_tp_group()
+
+        self.tp_rank = self.comm_group.rank_in_group
+        self.tp_size = self.comm_group.world_size
         self.num_embeddings = num_embeddings
         self.padding_size = padding_size
         self.org_vocab_size = org_num_embeddings or num_embeddings
@@ -268,7 +295,7 @@ class VocabParallelEmbedding(PluggableLayer):
             self.org_vocab_size_padded,
             self.num_embeddings,
             self.org_vocab_size,
-            tp_rank,
+            self.tp_rank,
             self.tp_size,
         )
         self.embedding_dim = embedding_dim
@@ -470,6 +497,9 @@ class VocabParallelEmbedding(PluggableLayer):
         param[loaded_weight.shape[0] :].data.fill_(0)
 
     def forward(self, input_):
+        if self.use_embedding_tp:
+            return self.forward_embedding_tp(input_)
+
         if self.tp_size > 1:
             # Build the mask.
             masked_input, input_mask = get_masked_input_and_mask(
@@ -490,6 +520,36 @@ class VocabParallelEmbedding(PluggableLayer):
         # Reduce across all the model parallel GPUs.
         output = tensor_model_parallel_all_reduce(output_parallel)
         return output
+
+    def forward_embedding_tp(self, input_):
+        """Embedding lookup with the table sharded across DP peers.
+
+        The token ids of the whole group are all-gathered so every rank can look
+        up its own vocab shard, then the per-shard results (zero outside the
+        shard) reduce-scatter back, giving each rank the embeddings for just its
+        own tokens. This is the all-reduce path with the redundant work removed.
+        """
+        num_tokens = input_.shape[0]
+        padded_num_tokens = get_fine_grained_tp_num_rows(num_tokens)
+        if padded_num_tokens > num_tokens:
+            input_ = F.pad(
+                input_, (0, padded_num_tokens - num_tokens), mode="constant", value=0
+            )
+
+        complete_input = self.comm_group.all_gather(input_, dim=0)
+        masked_input, input_mask = get_masked_input_and_mask(
+            complete_input,
+            self.shard_indices.org_vocab_start_index,
+            self.shard_indices.org_vocab_end_index,
+            self.shard_indices.num_org_vocab_padding,
+            self.shard_indices.added_vocab_start_index,
+            self.shard_indices.added_vocab_end_index,
+        )
+        output_parallel = self.quant_method.embedding(self, masked_input.long())
+        output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
+        output = self.comm_group.reduce_scatter(output_parallel, dim=0)
+
+        return output[:num_tokens]
 
     def extra_repr(self) -> str:
         s = f"num_embeddings={self.num_embeddings_per_partition}"

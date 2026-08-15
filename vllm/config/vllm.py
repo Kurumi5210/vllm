@@ -42,7 +42,7 @@ from .mamba import MambaConfig
 from .model import ModelConfig
 from .observability import ObservabilityConfig
 from .offload import OffloadConfig
-from .parallel import ParallelConfig
+from .parallel import FineGrainedTPConfig, ParallelConfig
 from .profiler import ProfilerConfig
 from .reasoning import ReasoningConfig
 from .scheduler import SchedulerConfig
@@ -369,6 +369,10 @@ class VllmConfig:
     """The configurations for distributed EC cache transfer."""
     reasoning_config: ReasoningConfig | None = None
     """The configurations for reasoning model."""
+    fine_grained_tp_config: FineGrainedTPConfig = Field(
+        default_factory=FineGrainedTPConfig
+    )
+    """Per-module tensor parallel sizes carved out of the data parallel axis."""
     # some opaque config, only used to provide additional information
     # for the hash computation, mainly used for testing, debugging or out of
     # tree config registration.
@@ -933,6 +937,41 @@ class VllmConfig:
             "expandable_segments is automatically disabled)."
         )
 
+    def _verify_fine_grained_tp_config(self) -> None:
+        """Reject fine-grained TP sizes that can't be cut out of the DP axis."""
+        fine_grained_tp_config = self.fine_grained_tp_config
+        if not fine_grained_tp_config.enabled:
+            return
+
+        dp_size = self.parallel_config.data_parallel_size
+        for name, size in fine_grained_tp_config.sizes().items():
+            if size > 1 and dp_size % size != 0:
+                raise ValueError(
+                    f"{name}={size} must divide data_parallel_size={dp_size}: "
+                    "fine-grained tensor parallel groups are formed by "
+                    "partitioning the data parallel ranks."
+                )
+
+        # The LoRA logits path applies the LoRA delta and remaps the sharded
+        # vocab on the full logits tensor, which lm_head TP never materializes
+        # on a single rank.
+        if fine_grained_tp_config.lmhead_tensor_parallel_size > 1 and (
+            self.lora_config is not None
+        ):
+            raise ValueError(
+                "lmhead_tensor_parallel_size > 1 is not supported together "
+                "with LoRA."
+            )
+
+        logger.info_once(
+            "Fine-grained tensor parallel enabled: %s",
+            {
+                name: size
+                for name, size in fine_grained_tp_config.sizes().items()
+                if size > 1
+            },
+        )
+
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
 
@@ -943,6 +982,8 @@ class VllmConfig:
             logger.info_once("Performance mode set to '%s'.", self.performance_mode)
 
         self.try_verify_and_update_config()
+
+        self._verify_fine_grained_tp_config()
 
         if self.model_config is not None:
             self.model_config.verify_with_parallel_config(self.parallel_config)

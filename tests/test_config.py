@@ -16,6 +16,7 @@ import vllm.envs as envs
 from vllm.compilation.backends import VllmBackend
 from vllm.config import (
     CompilationConfig,
+    FineGrainedTPConfig,
     KernelConfig,
     ModelConfig,
     ParallelConfig,
@@ -28,6 +29,7 @@ from vllm.config import (
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.config.kernel import IrOpPriorityConfig
 from vllm.config.load import LoadConfig
+from vllm.config.lora import LoRAConfig
 from vllm.config.utils import get_field
 from vllm.config.vllm import (
     OPTIMIZATION_LEVEL_TO_CONFIG,
@@ -1667,3 +1669,65 @@ def test_load_config_rejects_invalid_safetensors_load_strategy():
 def test_load_config_rejects_non_string_load_format(bad_load_format):
     with pytest.raises(pydantic.ValidationError):
         LoadConfig(load_format=bad_load_format)
+
+
+def test_fine_grained_tp_defaults_to_disabled():
+    """`EngineArgs` must not clobber the dataclass default with `None`.
+
+    Every consumer reads `fine_grained_tp_config.<size>` unguarded, so a `None`
+    default would raise `AttributeError` on a plain launch.
+    """
+    from vllm.engine.arg_utils import EngineArgs
+
+    for fine_grained_tp_config in (
+        VllmConfig().fine_grained_tp_config,
+        EngineArgs().fine_grained_tp_config,
+    ):
+        assert fine_grained_tp_config is not None
+        assert not fine_grained_tp_config.enabled
+        assert set(fine_grained_tp_config.sizes().values()) == {1}
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "oproj_tensor_parallel_size",
+        "lmhead_tensor_parallel_size",
+        "embedding_tensor_parallel_size",
+        "mlp_tensor_parallel_size",
+    ],
+)
+def test_fine_grained_tp_size_must_divide_dp_size(field):
+    # Groups are carved out of the DP ranks, so a non-divisor cannot be tiled.
+    VllmConfig(
+        parallel_config=ParallelConfig(data_parallel_size=8),
+        fine_grained_tp_config=FineGrainedTPConfig(**{field: 4}),
+    )
+    with pytest.raises(ValueError, match="must divide data_parallel_size=8"):
+        VllmConfig(
+            parallel_config=ParallelConfig(data_parallel_size=8),
+            fine_grained_tp_config=FineGrainedTPConfig(**{field: 3}),
+        )
+
+
+def test_fine_grained_tp_rejects_non_positive_size():
+    with pytest.raises(pydantic.ValidationError):
+        FineGrainedTPConfig(oproj_tensor_parallel_size=0)
+
+
+def test_lmhead_tp_rejects_lora():
+    # The LoRA logits path needs the full logits tensor, which lm_head TP never
+    # materializes on a single rank.
+    with pytest.raises(ValueError, match="not supported together with LoRA"):
+        VllmConfig(
+            parallel_config=ParallelConfig(data_parallel_size=8),
+            fine_grained_tp_config=FineGrainedTPConfig(lmhead_tensor_parallel_size=8),
+            lora_config=LoRAConfig(),
+        )
+
+    # Other fine-grained knobs are unaffected.
+    VllmConfig(
+        parallel_config=ParallelConfig(data_parallel_size=8),
+        fine_grained_tp_config=FineGrainedTPConfig(oproj_tensor_parallel_size=8),
+        lora_config=LoRAConfig(),
+    )

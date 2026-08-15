@@ -3,6 +3,7 @@
 """A layer that compute logits from hidden_stats."""
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 from vllm.config import get_current_vllm_config
@@ -11,7 +12,9 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_gather,
 )
+from vllm.distributed.parallel_state import get_lmhead_tp_group
 from vllm.model_executor.custom_op import PluggableLayer
+from vllm.model_executor.layers.utils import get_fine_grained_tp_num_rows
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
@@ -141,6 +144,11 @@ class LogitsProcessor(PluggableLayer):
         lm_head: VocabParallelEmbedding,
         embedding_bias: torch.Tensor | None,
     ) -> torch.Tensor | None:
+        # Gate on the head layer, not on the config, so we never run the
+        # fine-grained collectives against a globally TP-sharded lm_head.
+        if getattr(lm_head, "use_lmhead_tp", False):
+            return self._get_logits_lmhead_tp(hidden_states, lm_head, embedding_bias)
+
         # Get the logits for the next tokens.
         logits = self._apply_head(lm_head, hidden_states, embedding_bias)
 
@@ -151,6 +159,57 @@ class LogitsProcessor(PluggableLayer):
         if logits is not None:
             logits = logits[..., : self.org_vocab_size]
         return logits
+
+    def _get_logits_lmhead_tp(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        embedding_bias: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """Logits projection with lm_head sharded across DP peers.
+
+        Every rank all-gathers the group's hidden states so it can project them
+        through its own vocab shard, producing `[group_tokens, vocab / N]`. An
+        all-to-all then swaps token blocks for vocab blocks, leaving each rank
+        with the full vocab for only its own tokens.
+
+        Every rank in the group must supply the same number of rows. `num_reqs` is
+        never equalized across DP ranks, so pad up to the DP-wide token maximum
+        (which every rank agrees on) and slice the result back. For decode-heavy
+        batches -- the deployment this targets -- `num_reqs` already equals the
+        token count, so the padding is free.
+        """
+        lmhead_tp_group = get_lmhead_tp_group()
+        tp_size = lmhead_tp_group.world_size
+        num_rows = hidden_states.shape[0]
+
+        padded_num_rows = get_fine_grained_tp_num_rows(num_rows)
+        if padded_num_rows > num_rows:
+            hidden_states = F.pad(hidden_states, (0, 0, 0, padded_num_rows - num_rows))
+
+        gathered_hidden_states = lmhead_tp_group.all_gather(hidden_states, dim=0)
+        local_logits = self._apply_head(lm_head, gathered_hidden_states, embedding_bias)
+
+        # local_logits is [tp_size * padded_num_rows, vocab / tp_size], whose i-th
+        # row block holds rank i's rows under *this* rank's vocab shard. Reshaping
+        # to [tp_size, ...] makes block i the chunk all_to_all sends to rank i.
+        vocab_shard_size = local_logits.shape[-1]
+        send_buf = local_logits.reshape(
+            tp_size, padded_num_rows * vocab_shard_size
+        ).contiguous()
+        recv_buf = torch.empty_like(send_buf)
+        dist.all_to_all_single(recv_buf, send_buf, group=lmhead_tp_group.device_group)
+
+        # Received block i is this rank's rows under rank i's vocab shard, so
+        # interleaving the row axis back to the front restores global vocab order.
+        logits = (
+            recv_buf.view(tp_size, padded_num_rows, vocab_shard_size)
+            .transpose(0, 1)
+            .reshape(padded_num_rows, tp_size * vocab_shard_size)
+        )
+
+        # Remove the row padding and the vocab padding (if any).
+        return logits[:num_rows, : self.org_vocab_size]
 
     def get_top_tokens(
         self,

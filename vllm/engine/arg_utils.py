@@ -42,6 +42,7 @@ from vllm.config import (
     DiffusionConfig,
     ECTransferConfig,
     EPLBConfig,
+    FineGrainedTPConfig,
     KernelConfig,
     KVEventsConfig,
     KVTransferConfig,
@@ -677,6 +678,10 @@ class EngineArgs:
 
     ec_transfer_config: ECTransferConfig | None = None
     reasoning_config: ReasoningConfig = get_field(VllmConfig, "reasoning_config")
+
+    fine_grained_tp_config: FineGrainedTPConfig = get_field(
+        VllmConfig, "fine_grained_tp_config"
+    )
 
     generation_config: str = ModelConfig.generation_config
     enable_sleep_mode: bool = ModelConfig.enable_sleep_mode
@@ -1564,6 +1569,9 @@ class EngineArgs:
         vllm_group.add_argument("--reasoning-config", **vllm_kwargs["reasoning_config"])
         vllm_group.add_argument("--kernel-config", **vllm_kwargs["kernel_config"])
         vllm_group.add_argument(
+            "--fine-grained-tp-config", **vllm_kwargs["fine_grained_tp_config"]
+        )
+        vllm_group.add_argument(
             "--additional-config", **vllm_kwargs["additional_config"]
         )
         vllm_group.add_argument(
@@ -2390,6 +2398,7 @@ class EngineArgs:
             kv_events_config=self.kv_events_config,
             ec_transfer_config=self.ec_transfer_config,
             reasoning_config=self.reasoning_config,
+            fine_grained_tp_config=self.fine_grained_tp_config,
             profiler_config=self.profiler_config,
             additional_config=self.additional_config,
             optimization_level=self.optimization_level,

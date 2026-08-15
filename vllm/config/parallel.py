@@ -1011,3 +1011,40 @@ class ParallelConfig:
             )
 
         return self
+
+
+@config
+class FineGrainedTPConfig:
+    """Per-module tensor parallel sizes, carved out of the data parallel axis.
+
+    With DP attention every DP rank holds a full copy of `o_proj`, `lm_head` and
+    `embed_tokens` and recomputes them over its own tokens. Setting a size `N > 1`
+    here instead shards that module's weight across `N` DP peers and exchanges
+    tokens between them, trading a collective for `N`x less duplicated weight
+    memory and compute. Each size must divide `data_parallel_size`.
+    """
+
+    oproj_tensor_parallel_size: int = Field(default=1, ge=1)
+    """Tensor parallel size for the attention output projection."""
+    lmhead_tensor_parallel_size: int = Field(default=1, ge=1)
+    """Tensor parallel size for the LM head / logits projection."""
+    embedding_tensor_parallel_size: int = Field(default=1, ge=1)
+    """Tensor parallel size for the input token embedding table."""
+    mlp_tensor_parallel_size: int = Field(default=1, ge=1)
+    """Tensor parallel size for the transformer feed-forward blocks.
+
+    The process group is created but not yet consumed by any layer.
+    """
+
+    def sizes(self) -> dict[str, int]:
+        """Map of field name to configured size, for validation and logging."""
+        return {
+            "oproj_tensor_parallel_size": self.oproj_tensor_parallel_size,
+            "lmhead_tensor_parallel_size": self.lmhead_tensor_parallel_size,
+            "embedding_tensor_parallel_size": self.embedding_tensor_parallel_size,
+            "mlp_tensor_parallel_size": self.mlp_tensor_parallel_size,
+        }
+
+    @property
+    def enabled(self) -> bool:
+        return any(size > 1 for size in self.sizes().values())

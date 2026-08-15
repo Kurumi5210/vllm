@@ -486,6 +486,9 @@ class GPUModelRunner(
 
         self.is_pooling_model = model_config.runner_type == "pooling"
         self.enable_prompt_embeds = model_config.enable_prompt_embeds
+        self.lmhead_tensor_parallel_size = (
+            vllm_config.fine_grained_tp_config.lmhead_tensor_parallel_size
+        )
         self.is_multimodal_raw_input_only_model = (
             model_config.is_multimodal_raw_input_only_model
         )
@@ -6088,6 +6091,22 @@ class GPUModelRunner(
                     inputs_embeds=inputs_embeds,
                     **model_kwargs,
                 )
+
+                # With lm_head TP the logits projection runs collectives across
+                # DP peers. A rank executing a dummy batch would otherwise skip
+                # them while its peers are mid-collective, hanging the group.
+                # The row count does not have to match: both this call and the
+                # real one pad up to the same DP-wide maximum.
+                if (
+                    not is_profile
+                    and self.lmhead_tensor_parallel_size > 1
+                    and get_pp_group().is_last_rank
+                    and not self.is_pooling_model
+                ):
+                    dummy_hidden_states = (
+                        outputs[0] if self.use_aux_hidden_state_outputs else outputs
+                    )
+                    self.model.compute_logits(dummy_hidden_states[:1])
 
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs

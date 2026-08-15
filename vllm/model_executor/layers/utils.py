@@ -3,6 +3,7 @@
 """Utility methods for model layers."""
 
 from collections.abc import Callable
+from functools import cache
 
 import torch
 
@@ -29,6 +30,47 @@ def is_layer_moe_router_gate(prefix: str) -> bool:
     if not prefix:
         return False
     return prefix.rsplit(".", 1)[-1] in MOE_LAYER_ROUTER_GATE_SUFFIXES
+
+
+@cache
+def _disabled_fine_grained_tp_config():
+    from vllm.config import FineGrainedTPConfig
+
+    return FineGrainedTPConfig()
+
+
+def get_fine_grained_tp_config():
+    """Fine-grained TP sizes, defaulting to disabled outside a config context.
+
+    Layers may be constructed directly in unit tests without a
+    `set_current_vllm_config` context; treat that as the feature being off
+    rather than raising.
+    """
+    from vllm.config import get_current_vllm_config_or_none
+
+    vllm_config = get_current_vllm_config_or_none()
+    if vllm_config is None:
+        return _disabled_fine_grained_tp_config()
+    return vllm_config.fine_grained_tp_config
+
+
+def get_fine_grained_tp_num_rows(num_rows: int) -> int:
+    """Row count every rank of a fine-grained TP group must present.
+
+    The o_proj / lm_head / embedding collectives split and concatenate along the
+    token axis, so all ranks in the group have to agree on its length. DP only
+    equalizes token counts when CUDA graphs are enabled
+    (`_synchronize_dp_ranks` pads to the max across ranks only then), and the
+    logits projection runs on `num_reqs` rows which is never equalized. Padding
+    up to the DP-wide maximum is agreed on by every rank without an extra
+    collective, and is a no-op whenever the counts already match.
+    """
+    from vllm.forward_context import get_forward_context
+
+    dp_metadata = get_forward_context().dp_metadata
+    if dp_metadata is None:
+        return num_rows
+    return max(num_rows, int(dp_metadata.num_tokens_across_dp_cpu.max()))
 
 
 def get_token_bin_counts_and_mask(

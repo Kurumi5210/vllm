@@ -7,6 +7,8 @@ from collections.abc import Iterable
 from typing import Any
 
 import torch
+import torch.distributed as dist
+import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 from typing_extensions import TypeIs
 
@@ -19,6 +21,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
+from vllm.distributed.parallel_state import get_otp_group, get_tp_group
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.batch_invariant import (
@@ -30,6 +33,8 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.model_executor.layers.utils import (
     dispatch_unquantized_gemm,
+    get_fine_grained_tp_config,
+    get_fine_grained_tp_num_rows,
 )
 from vllm.model_executor.parameter import (
     BasevLLMParameter,
@@ -1588,9 +1593,23 @@ class RowParallelLinear(LinearBase):
         return_bias: bool = True,
         disable_tp: bool = False,
     ):
-        # Divide the weight matrix along the first dimension.
-        self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
-        self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
+        # Divide the weight matrix along the first dimension. o_proj may instead
+        # be sharded over a fine-grained group carved out of the DP axis; that
+        # path always reduce-scatters, so it needs reduce_results.
+        self.use_oproj_tp = False
+        if not disable_tp and reduce_results and prefix.endswith("o_proj"):
+            self.use_oproj_tp = (
+                get_fine_grained_tp_config().oproj_tensor_parallel_size > 1
+            )
+
+        if disable_tp:
+            self.comm_group = None
+            self.tp_rank = 0
+            self.tp_size = 1
+        else:
+            self.comm_group = get_otp_group() if self.use_oproj_tp else get_tp_group()
+            self.tp_rank = self.comm_group.rank_in_group
+            self.tp_size = self.comm_group.world_size
         self.input_size_per_partition = divide(input_size, self.tp_size)
         self.output_size_per_partition = output_size
         self.output_partition_sizes = [output_size]
@@ -1606,6 +1625,13 @@ class RowParallelLinear(LinearBase):
             return_bias=return_bias,
             disable_tp=disable_tp,
         )
+
+        # `LinearBase.__init__` re-seeds tp_rank/tp_size from the global TP group;
+        # restore this layer's group so weight loading and the forward collectives
+        # agree on the sharding.
+        if not disable_tp:
+            self.tp_rank = self.comm_group.rank_in_group
+            self.tp_size = self.comm_group.world_size
 
         self.input_is_parallel = input_is_parallel
         self.reduce_results = reduce_results
@@ -1677,6 +1703,9 @@ class RowParallelLinear(LinearBase):
         self,
         input_,
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        if self.use_oproj_tp:
+            return self.forward_oproj_tp(input_)
+
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1695,6 +1724,69 @@ class RowParallelLinear(LinearBase):
             output = tensor_model_parallel_all_reduce(output_parallel)
         else:
             output = output_parallel
+
+        if not self.return_bias:
+            return output
+        output_bias = self.bias if self.skip_bias_add else None
+        return output, output_bias
+
+    def forward_oproj_tp(
+        self,
+        input_,
+    ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        """Row-parallel forward with the weight sharded across DP peers.
+
+        Each rank holds `input_size / tp_size` of the reduction dimension but
+        starts out with all of it for its own tokens. An all-to-all trades
+        hidden-dim slices for peer tokens, so every rank ends up with the full
+        batch of the group over its own slice; the GEMM then produces partial
+        sums which reduce-scatter back into per-rank token ownership.
+
+        Every rank in the group must supply the same number of tokens, so the
+        batch is padded up to the DP-wide maximum first (a no-op once CUDA graphs
+        have equalized it).
+        """
+        if self.input_is_parallel:
+            input_parallel = input_
+        else:
+            split_input = split_tensor_along_last_dim(
+                input_, num_partitions=self.tp_size
+            )
+            input_parallel = split_input[self.tp_rank].contiguous()
+
+        num_tokens = input_parallel.size(0)
+        padded_num_tokens = get_fine_grained_tp_num_rows(num_tokens)
+        if padded_num_tokens > num_tokens:
+            input_parallel = F.pad(
+                input_parallel, (0, 0, 0, padded_num_tokens - num_tokens)
+            )
+
+        chunk_size = self.input_size_per_partition
+        total_num_tokens = padded_num_tokens * self.tp_size
+
+        # [num_tokens, input_size] -> [tp_size, num_tokens, chunk] -> flat, so
+        # that chunk i (destined for rank i) is contiguous.
+        send_buf = (
+            input_parallel.reshape(-1, self.tp_size, chunk_size)
+            .transpose(0, 1)
+            .contiguous()
+            .view(-1)
+        )
+        recv_buf = torch.empty(
+            total_num_tokens * chunk_size,
+            dtype=input_parallel.dtype,
+            device=input_parallel.device,
+        )
+        dist.all_to_all_single(recv_buf, send_buf, group=self.comm_group.device_group)
+        input_parallel = recv_buf.view(total_num_tokens, chunk_size)
+
+        # Only fuse bias add into GEMM for rank 0, as in the normal path.
+        bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+        output_parallel = self.quant_method.apply(self, input_parallel, bias_)
+
+        # Sum the partial products and hand each rank back its own tokens.
+        output = self.comm_group.reduce_scatter(output_parallel, dim=0)
+        output = output.view(padded_num_tokens, self.output_size)[:num_tokens]
 
         if not self.return_bias:
             return output
