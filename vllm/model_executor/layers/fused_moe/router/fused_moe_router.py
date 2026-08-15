@@ -5,8 +5,20 @@ from collections.abc import Callable
 
 import torch
 
+import vllm.envs as envs
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
+
+
+def _force_load_balance(topk_ids: torch.Tensor, num_experts: int) -> torch.Tensor:
+    """Replace the routing decision with a uniformly random one.
+
+    Benchmarking aid: spreads tokens evenly over the experts so MoE dispatch and
+    expert-GEMM cost can be measured without router skew. Model output becomes
+    meaningless, so this is only useful under `vllm bench`.
+    """
+    random_matrix = torch.rand(topk_ids.size(0), num_experts, device=topk_ids.device)
+    return torch.argsort(random_matrix, dim=1)[:, : topk_ids.size(1)].to(topk_ids.dtype)
 
 
 class FusedMoERouter(ABC):
@@ -70,6 +82,9 @@ class FusedMoERouter(ABC):
             topk_indices_dtype=topk_indices_dtype,
             input_ids=input_ids,
         )
+
+        if envs.VLLM_USE_FORCE_LOAD_BLANCE:
+            topk_ids = _force_load_balance(topk_ids, router_logits.shape[-1])
 
         # Write routing data for non-monolithic path (Triton, etc.)
         # (set by bind_routing_capture_to_model during capturer init)
