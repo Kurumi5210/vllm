@@ -168,6 +168,16 @@ class GateLinear(ReplicatedLinear):
     def forward(
         self, x: torch.Tensor
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        if self._has_empty_batch(x):
+            bias = self.bias if not self.skip_bias_add else None
+            output = self._empty_output(x, self.output_size)
+            if bias is not None:
+                output = output + bias
+            if self.out_dtype is not None and output.dtype != self.out_dtype:
+                output = output.to(self.out_dtype)
+            output_bias = self.bias if self.skip_bias_add else None
+            return output, output_bias
+
         # Tier 1: cuteDSL ll_bf16_gemm (SM90+, any dims)
         if self.allow_ll_bf16_gemm and x.shape[0] <= 16 and x.dtype == torch.bfloat16:
             from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (

@@ -226,6 +226,10 @@ class DeepseekV32IndexerMetadata:
 
     decode: DeepSeekV32IndexerDecodeMetadata | None = None
     prefill: DeepseekV32IndexerPrefillMetadata | None = None
+    # Sharded-CP pure prefill: the indexer K argument holds all-gathered
+    # global compact rows and prefill chunk cu_seqlen_ks/ke are global
+    # token-row spans, so the paged K-cache gather is skipped.
+    k_is_global_compact: bool = False
 
 
 def get_max_prefill_buffer_size(vllm_config: VllmConfig):

@@ -124,6 +124,14 @@ class ParallelConfig:
     prefill_context_parallel_size: int = Field(default=1, ge=1)
     """Number of ranks that split prefill sequence computation. PCP expands
     the process world size but does not increase the KV-cache shard count."""
+    enable_sharded_context_parallel: bool = False
+    """Enable Sharded Context Parallelism for DSA sparse MLA prefill.
+
+    This feature reuses the tensor-parallel process group as a CP group in the
+    first implementation, but keeps a CP-local hidden-state layout across
+    Transformer layers. It is mutually exclusive with existing PCP/DCP and
+    ubatching paths until those paths have explicit Sharded-CP support.
+    """
     data_parallel_size: int = Field(default=1, ge=1)
     """Number of data parallel groups. MoE layers will be sharded according to
     the product of the tensor, prefill-context, and data parallel sizes."""
@@ -523,6 +531,45 @@ class ParallelConfig:
             raise ValueError(
                 "dcp_comm_backend='a2a' requires decode_context_parallel_size > 1."
             )
+
+        if self.enable_sharded_context_parallel:
+            if self.tensor_parallel_size <= 1:
+                raise ValueError(
+                    "enable_sharded_context_parallel requires "
+                    "tensor_parallel_size > 1."
+                )
+            if self.pipeline_parallel_size != 1:
+                raise ValueError(
+                    "enable_sharded_context_parallel requires "
+                    "pipeline_parallel_size == 1."
+                )
+            if self.prefill_context_parallel_size != 1:
+                raise ValueError(
+                    "enable_sharded_context_parallel requires "
+                    "prefill_context_parallel_size == 1."
+                )
+            if self.decode_context_parallel_size != 1:
+                raise ValueError(
+                    "enable_sharded_context_parallel requires "
+                    "decode_context_parallel_size == 1."
+                )
+            if self.use_ubatching:
+                raise ValueError(
+                    "enable_sharded_context_parallel does not support "
+                    "DBO/ubatching yet."
+                )
+            if self.data_parallel_size != 1:
+                raise ValueError(
+                    "enable_sharded_context_parallel does not support "
+                    "data parallelism yet."
+                )
+            if self.enable_expert_parallel:
+                # TODO: validate FusedMoE EP combine semantics against the
+                # CP token-row reduce-scatter before enabling this.
+                raise ValueError(
+                    "enable_sharded_context_parallel does not support "
+                    "expert parallelism yet."
+                )
 
         return self
 

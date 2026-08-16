@@ -146,6 +146,8 @@ class SiluAndMul(CustomOp):
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+        if 0 in x.shape[:-1]:
+            return out
         self.op(out, x)
         return out
 

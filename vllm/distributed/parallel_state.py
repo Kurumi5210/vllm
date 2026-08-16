@@ -2093,6 +2093,21 @@ def destroy_model_parallel():
         _EPLB.destroy()
     _EPLB = None
 
+    # Sharded-CP keeps module-level communicator/stream singletons that must
+    # not survive re-initialization. Probe sys.modules instead of importing:
+    # the modules are only loaded when the feature was used, and importing
+    # them here would create a distributed -> model_executor cycle.
+    import sys
+
+    shard_linear = sys.modules.get(
+        "vllm.model_executor.layers.sharded_cp_shard_linear"
+    )
+    if shard_linear is not None:
+        shard_linear.destroy_sharded_cp_prefetch_group()
+    sharded_cp_utils = sys.modules.get("vllm.distributed.sharded_cp_utils")
+    if sharded_cp_utils is not None:
+        sharded_cp_utils.destroy_sharded_cp_comm_resources()
+
 
 def destroy_distributed_environment():
     global _WORLD, _NODE_COUNT

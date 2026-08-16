@@ -5,6 +5,18 @@ from dataclasses import dataclass
 import torch
 
 from vllm.config import CacheConfig
+from vllm.distributed.sharded_cp_compact_kv import (
+    all_gather_sharded_cp_compact_kv,
+    all_gather_sharded_cp_compact_kv_async,
+)
+from vllm.distributed.sharded_cp_utils import (
+    SHARDED_CP_GLOBAL_SLOT_MAPPING_KEY,
+    SHARDED_CP_TOKEN_RANGE_KEY,
+    SHARDED_CP_USE_GLOBAL_COMPACT_KV_KEY,
+    ShardedCPTokenRange,
+    get_sharded_cp_group,
+)
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -27,6 +39,7 @@ class MLAModules:
     is_sparse: bool
     topk_indices_buffer: torch.Tensor | None
     indexer_rotary_emb: torch.nn.Module | None = None
+    enable_sharded_context_parallel: bool = False
 
 
 # --8<-- [start:multi_head_latent_attention]
@@ -87,6 +100,9 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.indexer = mla_modules.indexer
         self.indexer_rope_emb = mla_modules.indexer_rotary_emb
         self.is_sparse = mla_modules.is_sparse
+        self.enable_sharded_context_parallel = (
+            mla_modules.enable_sharded_context_parallel
+        )
 
         # Whether to skip top-k token selection computation in this layer.
         # When True, the indexer will not be called, and the layer will reuse
@@ -114,8 +130,200 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             indexer=self.indexer,
             topk_indices_buffer=mla_modules.topk_indices_buffer,
         )
+        if self.enable_sharded_context_parallel and self.is_sparse:
+            # Global-compact KV and out-of-band cache writes are not
+            # expressible through the unified attention custom ops.
+            self.mla_attn.use_direct_call = True
 
         self.prefix = prefix
+
+    def _sharded_cp_token_range(self) -> ShardedCPTokenRange | None:
+        if not self.enable_sharded_context_parallel:
+            return None
+        if not self.is_sparse:
+            return None
+        if not is_forward_context_available():
+            return None
+        return get_forward_context().additional_kwargs.get(SHARDED_CP_TOKEN_RANGE_KEY)
+
+    def _sharded_cp_use_global_compact_kv(self) -> bool:
+        return bool(
+            get_forward_context().additional_kwargs.get(
+                SHARDED_CP_USE_GLOBAL_COMPACT_KV_KEY, False
+            )
+        )
+
+    def _sharded_cp_global_slot_mapping(self, layer_name: str) -> torch.Tensor | None:
+        global_slot_mapping = get_forward_context().additional_kwargs.get(
+            SHARDED_CP_GLOBAL_SLOT_MAPPING_KEY
+        )
+        if isinstance(global_slot_mapping, dict):
+            return global_slot_mapping.get(layer_name)
+        return None
+
+    def _write_sharded_cp_global_caches(
+        self,
+        kv_c_global: torch.Tensor,
+        k_pe_global: torch.Tensor,
+        indexer_k_global: torch.Tensor,
+    ) -> None:
+        """Persist all-gathered global compact rows with global slot IDs.
+
+        Every CP rank writes the full batch so its paged MLA and indexer-K
+        caches stay complete for later steps regardless of how requests are
+        redistributed across ranks.
+        """
+        attn_slot_mapping = self._sharded_cp_global_slot_mapping(
+            self.mla_attn.layer_name
+        )
+        if attn_slot_mapping is not None:
+            self.mla_attn.update_kv_cache(
+                kv_c_global,
+                k_pe_global,
+                attn_slot_mapping[: kv_c_global.shape[0]],
+            )
+        # Shared top-k layers (IndexCache) have no indexer of their own; they
+        # reuse the previous layer's top-k buffer and skip the Indexer-K cache.
+        if self.indexer is None:
+            return
+        indexer_k_cache = getattr(self.indexer, "k_cache", None)
+        indexer_prefix = getattr(
+            indexer_k_cache, "prefix", f"{self.prefix}.indexer.k_cache"
+        )
+        indexer_slot_mapping = self._sharded_cp_global_slot_mapping(indexer_prefix)
+        if indexer_slot_mapping is not None:
+            self.indexer.update_local_k_cache(
+                indexer_k_global,
+                layer_slot_mapping=indexer_slot_mapping[: indexer_k_global.shape[0]],
+            )
+
+    def _forward_empty_sharded_cp(
+        self,
+        hidden_states: torch.Tensor,
+        token_range: ShardedCPTokenRange,
+    ) -> torch.Tensor:
+        """A rank owning zero rows still joins the compact-KV all-gather and
+        persists the gathered global rows into its local caches."""
+        indexer_head_dim = self.indexer.head_dim if self.indexer is not None else 0
+        kv_c_normed = hidden_states.new_empty((0, self.kv_lora_rank))
+        k_pe = hidden_states.new_empty((0, 1, self.qk_rope_head_dim))
+        indexer_k = hidden_states.new_empty((0, indexer_head_dim))
+        kv_c_global, k_pe_global, indexer_k_global = all_gather_sharded_cp_compact_kv(
+            kv_c_normed,
+            k_pe,
+            indexer_k,
+            token_range,
+            group=get_sharded_cp_group().device_group,
+        )
+        self._write_sharded_cp_global_caches(
+            kv_c_global, k_pe_global, indexer_k_global
+        )
+        return hidden_states.new_empty((0, self.num_heads * self.v_head_dim))
+
+    def _forward_sharded_cp(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        token_range: ShardedCPTokenRange,
+        llama_4_scaling: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if self.q_lora_rank is None:
+            raise RuntimeError(
+                "Sharded-CP sparse MLA requires q_lora_rank for the Indexer."
+            )
+        use_global_compact_kv = self._sharded_cp_use_global_compact_kv()
+        if token_range.num_tokens == 0:
+            attn_out = self._forward_empty_sharded_cp(hidden_states, token_range)
+            return self.o_proj(attn_out)[0]
+
+        assert self.fused_qkv_a_proj is not None
+        assert self.q_a_layernorm is not None
+        assert self.q_b_proj is not None
+        qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+        q_c, kv_lora = qkv_lora.split(
+            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+            dim=-1,
+        )
+        q_c = self.q_a_layernorm(q_c)
+        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        kv_c_normed = self.kv_a_layernorm(kv_c)
+        k_pe = k_pe.unsqueeze(1)
+        if self.rotary_emb is not None:
+            # Rotate K before Q so the compact-KV all-gather can start early
+            # and overlap with the q_b_proj GEMM and Q rope.
+            k_pe, _ = self.rotary_emb(positions, k_pe, None)
+
+        compact_kv_handle = None
+        try:
+            if self.indexer is not None:
+                indexer_k, indexer_weights_raw = self.indexer.project_kw(
+                    hidden_states, positions, self.indexer_rope_emb
+                )
+            else:
+                # Shared top-k layer: gather MLA KV only; the previous
+                # layer's top-k buffer is reused as-is.
+                indexer_k = hidden_states.new_empty((hidden_states.shape[0], 0))
+                indexer_weights_raw = None
+            compact_kv_handle = all_gather_sharded_cp_compact_kv_async(
+                kv_c_normed,
+                k_pe,
+                indexer_k,
+                token_range,
+                group=get_sharded_cp_group().device_group,
+            )
+
+            q = self.q_b_proj(q_c)[0]
+            q = q.view(-1, self.num_heads, self.qk_head_dim)
+            if self.rotary_emb is not None:
+                q_pe, _ = self.rotary_emb(
+                    positions, q[..., self.qk_nope_head_dim :], None
+                )
+                q[..., self.qk_nope_head_dim :] = q_pe
+
+            kv_c_global, k_pe_global, indexer_k_global = compact_kv_handle.wait()
+            self._write_sharded_cp_global_caches(
+                kv_c_global, k_pe_global, indexer_k_global
+            )
+
+            if use_global_compact_kv:
+                if self.indexer is not None and not self.skip_topk:
+                    assert indexer_weights_raw is not None
+                    q_fp8, q_scale = self.indexer.project_q(
+                        q_c, positions, self.indexer_rope_emb
+                    )
+                    indexer_weights = self.indexer.scale_weights(
+                        indexer_weights_raw, q_scale
+                    )
+                    self.indexer.forward_global_compact(
+                        hidden_states, q_fp8, indexer_k_global, indexer_weights
+                    )
+            elif self.indexer is not None and not self.skip_topk:
+                self.indexer(
+                    hidden_states,
+                    q_c,
+                    positions,
+                    self.indexer_rope_emb,
+                )
+        except Exception:
+            if compact_kv_handle is not None:
+                compact_kv_handle.release()
+            raise
+
+        if llama_4_scaling is not None:
+            q *= llama_4_scaling
+
+        if use_global_compact_kv:
+            attn_kv_c, attn_k_pe = kv_c_global, k_pe_global
+        else:
+            attn_kv_c, attn_k_pe = kv_c_normed, k_pe
+        attn_out = self.mla_attn(
+            q,
+            attn_kv_c,
+            attn_k_pe,
+            output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
+            use_global_kv=use_global_compact_kv,
+        )
+        return self.o_proj(attn_out)[0]
 
     def forward(
         self,
@@ -123,6 +331,15 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        sharded_cp_token_range = self._sharded_cp_token_range()
+        if sharded_cp_token_range is not None:
+            return self._forward_sharded_cp(
+                positions,
+                hidden_states,
+                sharded_cp_token_range,
+                llama_4_scaling,
+            )
+
         q_c = None
         kv_lora = None
 

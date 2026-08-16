@@ -586,12 +586,47 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
         return self._chunked_prefill_workspace_size
 
+    def update_kv_cache(
+        self,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        layer_slot_mapping: torch.Tensor | None = None,
+    ) -> None:
+        """Write compact KV into this layer's cache outside forward().
+
+        Used by the Sharded-CP path to persist all-gathered global compact KV
+        rows with global slot IDs.
+        """
+        forward_context: ForwardContext = get_forward_context()
+        if forward_context.attn_metadata is None:
+            return
+
+        if layer_slot_mapping is None:
+            slot_mapping = forward_context.slot_mapping
+            assert isinstance(slot_mapping, dict), (
+                f"Expected slot_mapping to be a dict, got {type(slot_mapping)}. "
+            )
+            layer_slot_mapping = slot_mapping.get(self.layer_name)
+
+        if layer_slot_mapping is None:
+            return
+
+        self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
+            kv_c_normed,
+            k_pe,
+            self.kv_cache,
+            layer_slot_mapping,
+            self.kv_cache_dtype,
+            self._k_scale,
+        )
+
     def forward(
         self,
         q: torch.Tensor,
         kv_c_normed: torch.Tensor,
         k_pe: torch.Tensor,
         output_shape: torch.Size | None = None,
+        use_global_kv: bool = False,
     ) -> torch.Tensor:
         if self.calculate_kv_scales:
             torch.ops.vllm.maybe_calc_kv_scales(
@@ -620,36 +655,47 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 f"Expected slot_mapping to be a dict, got {type(slot_mapping)}. "
             )
             layer_slot_mapping = slot_mapping.get(self.layer_name)
-            kv_for_cache, kpe_for_cache, layer_slot_mapping = (
-                maybe_gather_mla_latent_cache_inputs(
-                    kv_c_normed,
-                    k_pe,
-                    layer_slot_mapping,
-                    attn_metadata.num_decode_tokens
-                    if attn_metadata is not None
-                    else None,
-                    self.use_pcp,
+            if use_global_kv:
+                # Sharded-CP pure prefill: attend directly over the caller's
+                # all-gathered global compact KV; the cache write happens
+                # separately via update_kv_cache with global slot IDs.
+                attn_kv = torch.cat((kv_c_normed, k_pe.squeeze(1)), dim=-1)
+            else:
+                kv_for_cache, kpe_for_cache, layer_slot_mapping = (
+                    maybe_gather_mla_latent_cache_inputs(
+                        kv_c_normed,
+                        k_pe,
+                        layer_slot_mapping,
+                        attn_metadata.num_decode_tokens
+                        if attn_metadata is not None
+                        else None,
+                        self.use_pcp,
+                    )
                 )
-            )
-            self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
-                kv_for_cache,
-                kpe_for_cache,
-                self_kv_cache,
-                layer_slot_mapping,
-                self.kv_cache_dtype,
-                self._k_scale,
-            )
+                self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
+                    kv_for_cache,
+                    kpe_for_cache,
+                    self_kv_cache,
+                    layer_slot_mapping,
+                    self.kv_cache_dtype,
+                    self._k_scale,
+                )
+                attn_kv = self_kv_cache
             output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
             self.forward_impl(
                 q,
                 kv_c_normed,
                 k_pe,
-                self_kv_cache,
+                attn_kv,
                 attn_metadata,
                 output=output,
             )
             return output
         else:
+            if use_global_kv:
+                raise RuntimeError(
+                    "Sharded-CP global compact KV requires direct MLA calls."
+                )
             encoded = _encode_layer_name(self.layer_name)
             kv_cache_dummy_dep = torch.ops.vllm.unified_mla_kv_cache_update(
                 kv_c_normed,
@@ -759,6 +805,14 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 self.prefill_backend is not None
                 and prefill_max_seq_len <= attn_metadata.topk_tokens  # type: ignore[attr-defined]
                 and not self._vllm_config.attention_config.sparse_mla_force_mqa
+                # Sharded-CP global compact KV: k_c_normed/k_pe hold all
+                # global token rows while q holds only this rank's rows, so
+                # the dense-MHA path would pair queries with the wrong K/V.
+                # The MQA path reads the gathered KV via top-k indices and is
+                # the only correct choice here.
+                and not getattr(
+                    attn_metadata, "topk_indices_are_global_compact_offsets", False
+                )
             )
             if not use_mha:
                 num_mqa_tokens = q.size(0)
