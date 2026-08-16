@@ -3968,9 +3968,25 @@ class GPUModelRunner(
         local_builds: list[tuple[Any, CommonAttentionMetadata, list[str]]],
         pure_prefill: bool,
     ) -> tuple[ShardedCPTokenRange, dict[str, Any], bool]:
-        use_global_compact_kv = pure_prefill and all(
+        backends_support = all(
             supports_global_compact_kv(local_md) for local_md, _, _ in local_builds
         )
+        use_global_compact_kv = pure_prefill and backends_support
+        if not backends_support:
+            # Without the override the batch runs over the paged KV cache, so
+            # the CP path pays the compact-KV all-gather and the global cache
+            # writes without getting the compact-attention benefit.
+            logger.warning_once(
+                "Sharded-CP: global compact KV is unavailable for the "
+                "selected attention backend(s), so every batch uses the "
+                "paged-KV path. Expect the CP communication cost without its "
+                "attention benefit."
+            )
+        elif not pure_prefill:
+            logger.debug_once(
+                "Sharded-CP: batch is not a pure first prefill, using the "
+                "paged-KV path."
+            )
         local_attn_metadata: dict[str, Any] = {}
         for local_md, local_cm, layer_names in local_builds:
             if use_global_compact_kv:
