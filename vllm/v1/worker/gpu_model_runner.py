@@ -149,6 +149,7 @@ from vllm.v1.attention.backends.linear_attn import (
     BailingLinearAttentionMetadataBuilder,
 )
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
+from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.mla.sharded_cp_metadata import (
     annotate_token_range_with_request_fragments,
     apply_global_compact_kv_overrides,
@@ -3913,21 +3914,27 @@ class GPUModelRunner(
         )
 
     def _validate_sharded_cp_attn_backends(self) -> None:
-        """Reject auto-selected backends without Sharded-CP support.
+        """Require every attention group to be sparse MLA or the indexer.
 
-        Config validation only covers explicitly requested backends; this is
-        the re-validation for backends resolved at runtime.
+        Metadata localization is backend agnostic (it re-runs the registered
+        builders on a localized CommonAttentionMetadata), so any sparse MLA
+        backend works; those whose metadata the global-compact-KV override
+        does not recognize simply fall back to the paged-KV path. What the CP
+        path does require is the DSA sparse flow -- an indexer and a top-k
+        buffer -- hence the capability check rather than a backend allowlist.
         """
-        supported = {"FLASHMLA_SPARSE", "DEEPSEEK_V32_INDEXER"}
         for group in self._attn_group_iterator():
-            name = group.backend.get_name()
-            if name not in supported:
-                raise ValueError(
-                    "enable_sharded_context_parallel does not support the "
-                    f"auto-selected attention backend {name} (layers "
-                    f"{group.layer_names[:2]}...). Supported backends: "
-                    f"{sorted(supported)}."
-                )
+            backend = group.backend
+            name = backend.get_name()
+            if name == DeepseekV32IndexerBackend.get_name() or (
+                backend.is_mla() and backend.is_sparse()
+            ):
+                continue
+            raise ValueError(
+                "enable_sharded_context_parallel requires sparse MLA "
+                f"attention, but layers {group.layer_names[:2]}... use "
+                f"{name}."
+            )
 
     @contextmanager
     def _maybe_sharded_cp_forward_context(self) -> Iterator[None]:
