@@ -934,7 +934,10 @@ class Indexer(nn.Module):
             k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
         )
         # Rotation is identical for Q and K, so pass K through the query slot.
-        k_pe, _ = rotary_emb(positions, k_pe.unsqueeze(1), None)
+        # The rope requires a key as well; a single-head scratch tensor is
+        # enough since cos/sin broadcast over heads.
+        k_pe = k_pe.unsqueeze(1)
+        k_pe, _ = rotary_emb(positions, k_pe, torch.zeros_like(k_pe))
         k_pe = k_pe.reshape(-1, self.rope_dim)
         return torch.cat([k_pe, k_nope], dim=-1), weights_raw
 
@@ -950,7 +953,11 @@ class Indexer(nn.Module):
         q_pe, q_nope = torch.split(
             q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
         )
-        q_pe, _ = rotary_emb(positions, q_pe, None)
+        q_pe, _ = rotary_emb(
+            positions,
+            q_pe,
+            q_pe.new_zeros((q_pe.shape[0], 1, self.rope_dim)),
+        )
         q_pe = q_pe.reshape(-1, self.n_head, self.rope_dim)
         q = torch.cat([q_pe, q_nope], dim=-1)
         q = q.view(-1, self.head_dim)
