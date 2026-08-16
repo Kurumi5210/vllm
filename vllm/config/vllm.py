@@ -305,9 +305,17 @@ OPTIMIZATION_LEVEL_TO_CONFIG = {
 
 # Sparse MLA backends with Sharded-CP metadata localization support
 # (see vllm/v1/attention/backends/mla/sharded_cp_metadata.py).
+# Sparse MLA backends usable with Sharded-CP. Metadata localization is
+# backend agnostic, so this is every sparse MLA backend; the ones whose
+# metadata the global-compact-KV override does not recognize fall back to the
+# paged-KV path (see sharded_cp_metadata.supports_global_compact_kv).
 SHARDED_CP_SPARSE_MLA_BACKENDS = frozenset(
     {
         AttentionBackendEnum.FLASHMLA_SPARSE,
+        AttentionBackendEnum.FLASH_ATTN_MLA_SPARSE,
+        AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
+        AttentionBackendEnum.ROCM_AITER_MLA_SPARSE,
+        AttentionBackendEnum.XPU_MLA_SPARSE,
     }
 )
 

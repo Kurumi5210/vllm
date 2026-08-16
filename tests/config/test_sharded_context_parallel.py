@@ -191,23 +191,31 @@ def test_vllm_config_rejects_sharded_cp_with_cudagraphs(cudagraph_mode):
         )
 
 
-@pytest.mark.parametrize(
-    "backend",
-    [
-        AttentionBackendEnum.FLASHMLA,
-        # Sparse backends without Sharded-CP metadata localization support
-        # are rejected when explicitly requested.
-        AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
-        AttentionBackendEnum.ROCM_AITER_MLA_SPARSE,
-        AttentionBackendEnum.XPU_MLA_SPARSE,
-    ],
-)
-def test_vllm_config_rejects_sharded_cp_with_unsupported_backend(backend):
+def test_vllm_config_rejects_sharded_cp_with_dense_mla_backend():
     with pytest.raises(ValueError, match="Supported backends"):
         _make_sharded_cp_vllm_config_for_validation(
             model_config=FakeModelConfig(),
-            attention_backend=backend,
+            attention_backend=AttentionBackendEnum.FLASHMLA,
         )
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        AttentionBackendEnum.FLASHMLA_SPARSE,
+        # Auto-selected on some GPUs; localization is backend agnostic and the
+        # compact-KV override degrades to the paged path.
+        AttentionBackendEnum.FLASH_ATTN_MLA_SPARSE,
+        AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
+    ],
+)
+def test_vllm_config_accepts_sharded_cp_sparse_mla_backends(backend):
+    config = _make_sharded_cp_vllm_config_for_validation(
+        model_config=FakeModelConfig(),
+        attention_backend=backend,
+    )
+
+    assert config.attention_config.backend == backend
 
 
 @pytest.mark.parametrize(
