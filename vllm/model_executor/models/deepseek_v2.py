@@ -984,6 +984,29 @@ class Indexer(nn.Module):
     ) -> torch.Tensor:
         return weights_raw * q_scale * self.softmax_scale * self.n_head_scale
 
+    def forward_local_paged(
+        self,
+        hidden_states: torch.Tensor,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Score local Q against the paged Indexer-K cache.
+
+        Used by the Sharded-CP paged fallback: the cache already holds every
+        global row (written by update_local_k_cache), and Q/K/weights were
+        computed by project_q/project_kw, so the K projection and the cache
+        insert must not run again. ``k`` is unused when the insert is skipped.
+        """
+        # The custom op's schema types k as a Tensor, so pass an empty one
+        # rather than None; it is never read when the insert is skipped.
+        empty_k = hidden_states.new_empty((0, self.head_dim))
+        saved = self.indexer_op.skip_k_cache_insert
+        self.indexer_op.skip_k_cache_insert = True
+        try:
+            return self.indexer_op(hidden_states, q_fp8, empty_k, weights)
+        finally:
+            self.indexer_op.skip_k_cache_insert = saved
+
     def forward_global_compact(
         self,
         hidden_states: torch.Tensor,
