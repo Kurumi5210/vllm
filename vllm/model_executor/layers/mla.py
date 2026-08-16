@@ -137,6 +137,15 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         self.prefix = prefix
 
+    def _rope_scratch(self, like: torch.Tensor) -> torch.Tensor:
+        """Scratch key tensor for a query-only rope call.
+
+        DeepseekScalingRotaryEmbedding requires a query/key pair. Only one
+        side is needed here, so pass a single-head scratch tensor: cos/sin
+        broadcast over the head dimension, making this negligible.
+        """
+        return like.new_zeros((like.shape[0], 1, self.qk_rope_head_dim))
+
     def _sharded_cp_token_range(self) -> ShardedCPTokenRange | None:
         if not self.enable_sharded_context_parallel:
             return None
@@ -250,8 +259,11 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         k_pe = k_pe.unsqueeze(1)
         if self.rotary_emb is not None:
             # Rotate K before Q so the compact-KV all-gather can start early
-            # and overlap with the q_b_proj GEMM and Q rope.
-            k_pe, _ = self.rotary_emb(positions, k_pe, None)
+            # and overlap with the q_b_proj GEMM and Q rope. DeepSeek's rope
+            # rotates a query/key pair and asserts both are present, so the
+            # unused side is a [rows, 1, rope_dim] scratch tensor; cos/sin
+            # broadcast over heads, so it stays cheap.
+            k_pe, _ = self.rotary_emb(positions, k_pe, self._rope_scratch(k_pe))
 
         compact_kv_handle = None
         try:
@@ -276,7 +288,9 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             q = q.view(-1, self.num_heads, self.qk_head_dim)
             if self.rotary_emb is not None:
                 q_pe, _ = self.rotary_emb(
-                    positions, q[..., self.qk_nope_head_dim :], None
+                    positions,
+                    q[..., self.qk_nope_head_dim :],
+                    self._rope_scratch(q),
                 )
                 q[..., self.qk_nope_head_dim :] = q_pe
 
