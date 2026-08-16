@@ -868,12 +868,28 @@ weight-gather variant above.
   linear layers, and GateLinear short-circuit empty batches.
 - **Known gap: MoE gathers BF16 activations.** The design calls for gathering
   quantized activations, scales, and routing metadata; the current
+- **Expert parallelism is supported and expected.** A 256-expert MoE cannot
+  be deployed without it (vllm-ascend's DSA-CP even asserts
+  `enable_expert_parallel=True` for MoE models). With CP's constraints
+  (DP=1, PCP=1, no SP-MoE) `FusedMoEParallelConfig.use_all2all_kernels` is
+  False, so EP takes the naive path: every rank must see every token and
+  contributes a partial sum over the experts it owns. That is why the CP MoE
+  path all-gathers the rows before the experts and reduce-scatters after --
+  the reduce-scatter completes exactly that expert reduction. The MoE path
+  also checks `moe_config.skip_final_all_reduce`: if FusedMoE did not honor
+  `reduce_results=False` its output is already reduced, and reducing again
+  would scale it by the CP world size, so those rows are only sliced.
+  vllm-ascend instead runs the experts directly on CP-local rows, which is
+  possible because its DSA-CP requires sequence parallelism and therefore
+  gets real all-to-all dispatch; reaching that would let us drop the
+  pre-MoE gather entirely.
   implementation gathers BF16 hidden states plus router logits, so MoE
   communication volume does not yet match the thesis target.
-- **Fail-closed scope.** v1 requires `cudagraph_mode=NONE` (CUDA-graph token
-  padding is incompatible with the CP token-row layout),
-  `data_parallel_size=1`, no expert parallelism, no speculative decoding, and
-  the `FLASHMLA_SPARSE` backend (auto-selected backends are re-validated in
+- **Fail-closed scope.** v1 requires `--enforce-eager` (CUDA-graph and
+  sequence-parallel token padding conflict with the CP token-row layout, and
+  the CP path issues raw c10d collectives Dynamo cannot trace),
+  `data_parallel_size=1`, no sequence-parallel MoE, no speculative decoding,
+  no model-weight offloading, and the `FLASHMLA_SPARSE` backend (auto-selected backends are re-validated in
   the model runner). Only architectures whose forward implements the CP
   scatter/gather are accepted. Batches whose backend metadata does not
   support global-compact-KV overrides fall back to the paged-KV path.

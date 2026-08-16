@@ -563,13 +563,6 @@ class ParallelConfig:
                     "enable_sharded_context_parallel does not support "
                     "data parallelism yet."
                 )
-            if self.enable_expert_parallel:
-                # TODO: validate FusedMoE EP combine semantics against the
-                # CP token-row reduce-scatter before enabling this.
-                raise ValueError(
-                    "enable_sharded_context_parallel does not support "
-                    "expert parallelism yet."
-                )
 
         return self
 
