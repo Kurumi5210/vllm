@@ -26,6 +26,7 @@ from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.triton_utils import HAS_TRITON
 from vllm.utils import random_uuid
 from vllm.utils.hashing import safe_hash
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from .attention import AttentionConfig
 from .cache import CacheConfig
@@ -301,6 +302,29 @@ OPTIMIZATION_LEVEL_TO_CONFIG = {
     OptimizationLevel.O2: OPTIMIZATION_LEVEL_02,
     OptimizationLevel.O3: OPTIMIZATION_LEVEL_03,
 }
+
+# Sparse MLA backends with Sharded-CP metadata localization support
+# (see vllm/v1/attention/backends/mla/sharded_cp_metadata.py).
+SHARDED_CP_SPARSE_MLA_BACKENDS = frozenset(
+    {
+        AttentionBackendEnum.FLASHMLA_SPARSE,
+    }
+)
+
+# Architectures whose model forward implements the Sharded-CP token
+# scatter/gather (see DeepseekV2Model._maybe_scatter_to_sharded_cp). Keep in
+# sync with the registry aliases that map to deepseek_v2: other DSA models
+# (e.g. Glm4MoeLiteForCausalLM) reuse DeepseekV2MLAAttention but not the
+# model-level scatter, so they must stay out of this set.
+SHARDED_CP_SUPPORTED_ARCHITECTURES = frozenset(
+    {
+        "DeepseekForCausalLM",
+        "DeepseekV2ForCausalLM",
+        "DeepseekV3ForCausalLM",
+        "DeepseekV32ForCausalLM",
+        "GlmMoeDsaForCausalLM",
+    }
+)
 
 
 @config(config=ConfigDict(arbitrary_types_allowed=True))
@@ -933,6 +957,90 @@ class VllmConfig:
             "expandable_segments is automatically disabled)."
         )
 
+    def _validate_sharded_context_parallel_config(self) -> None:
+        """Validate cross-config requirements for Sharded-CP.
+
+        ParallelConfig validates topology-only constraints. Checks that depend
+        on the model, attention backend, speculative decoding, or compilation
+        defaults live here. Backends that are auto-selected at runtime are
+        re-validated in the model runner once the backend is known.
+        """
+        if not self.parallel_config.enable_sharded_context_parallel:
+            return
+
+        if self.model_config is None:
+            raise ValueError("enable_sharded_context_parallel requires a model_config.")
+        if not getattr(self.model_config, "use_mla", False):
+            raise ValueError("enable_sharded_context_parallel requires an MLA model.")
+        hf_config = getattr(self.model_config, "hf_config", None)
+        if hf_config is None or not hasattr(hf_config, "index_topk"):
+            raise ValueError(
+                "enable_sharded_context_parallel requires a DSA sparse MLA "
+                "model config with index_topk."
+            )
+        # The CP token scatter/gather lives in the model's forward, so only
+        # architectures that implement it can be enabled. Other DSA models
+        # (e.g. Glm4MoeLiteForCausalLM) reuse DeepseekV2MLAAttention but feed
+        # it global token rows, which would fail in the first compact-KV
+        # gather.
+        architectures = getattr(self.model_config, "architectures", None) or []
+        if not any(
+            arch in SHARDED_CP_SUPPORTED_ARCHITECTURES for arch in architectures
+        ):
+            raise ValueError(
+                "enable_sharded_context_parallel is only implemented for "
+                f"{sorted(SHARDED_CP_SUPPORTED_ARCHITECTURES)}, got "
+                f"{list(architectures)}."
+            )
+
+        backend = self.attention_config.backend
+        if backend is not None and backend not in SHARDED_CP_SPARSE_MLA_BACKENDS:
+            supported = ", ".join(
+                sorted(b.name for b in SHARDED_CP_SPARSE_MLA_BACKENDS)
+            )
+            raise ValueError(
+                "enable_sharded_context_parallel requires a sparse MLA "
+                f"attention backend, got {backend.name}. Supported backends: "
+                f"{supported}."
+            )
+
+        if self.speculative_config is not None:
+            raise ValueError(
+                "enable_sharded_context_parallel does not support speculative "
+                "decoding yet."
+            )
+        if self.parallel_config.use_sequence_parallel_moe:
+            # Both want to own o_proj's output layout: SP-MoE reduce-scatters
+            # the attention output again over TP, on rows Sharded-CP has
+            # already sharded.
+            raise ValueError(
+                "enable_sharded_context_parallel does not support "
+                "sequence-parallel MoE yet."
+            )
+        if self.compilation_config.pass_config.enable_sp:
+            # Sequence parallelism pads scheduled tokens up to a TP multiple
+            # in the runner (_pad_for_sequence_parallelism), while the CP
+            # token range is built from the unpadded query_start_loc, so the
+            # row counts disagree. fuse_gemm_comms forces enable_sp, so this
+            # covers async TP too.
+            raise ValueError(
+                "enable_sharded_context_parallel does not support sequence "
+                "parallelism (pass_config.enable_sp / fuse_gemm_comms): its "
+                "token padding conflicts with the CP token-row layout."
+            )
+        if (
+            self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+            or self.compilation_config.mode not in (None, CompilationMode.NONE)
+        ):
+            # CUDA-graph token padding conflicts with the CP token-row layout,
+            # and the CP path itself is not Dynamo-traceable: it issues raw
+            # c10d collectives on side streams and branches on Python ints
+            # taken from the per-batch token range.
+            raise ValueError(
+                "enable_sharded_context_parallel requires eager execution. "
+                "Pass --enforce-eager."
+            )
+
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
 
@@ -1452,6 +1560,7 @@ class VllmConfig:
                 "to True to enable."
             )
         current_platform.check_and_update_config(self)
+        self._validate_sharded_context_parallel_config()
 
         if self.use_v2_model_runner:
             self._validate_v2_model_runner()

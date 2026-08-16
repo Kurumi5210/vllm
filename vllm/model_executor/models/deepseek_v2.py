@@ -44,6 +44,14 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_reduce_scatter,
 )
+from vllm.distributed.sharded_cp_utils import (
+    SHARDED_CP_TOKEN_RANGE_KEY,
+    ShardedCPTokenRange,
+    all_gather_token_rows,
+    get_sharded_cp_group,
+    reduce_scatter_token_rows,
+)
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention, RSWAAttention
@@ -52,6 +60,10 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
     GateLinear,
     fused_moe_make_expert_params_mapping,
+)
+from vllm.model_executor.layers.fused_moe.sharded_cp_moe import (
+    all_gather_sharded_cp_moe_inputs,
+    reduce_scatter_sharded_cp_moe_output,
 )
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -297,6 +309,13 @@ class DeepseekV2MoE(nn.Module):
         self.n_shared_experts: int = config.n_shared_experts
 
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
+        self.use_sharded_cp_token_parallel = (
+            parallel_config.enable_sharded_context_parallel
+        )
+        if self.use_sharded_cp_token_parallel:
+            # CP combines partial expert outputs with a token-row
+            # reduce-scatter instead of the internal TP all-reduce.
+            reduce_results = False
 
         if config.hidden_act != "silu":
             raise ValueError(
@@ -394,6 +413,64 @@ class DeepseekV2MoE(nn.Module):
                 self.gate.e_score_correction_bias.data.to(self.gate.out_dtype)
             )
 
+    def _maybe_get_sharded_cp_token_range(self) -> ShardedCPTokenRange | None:
+        if not is_forward_context_available():
+            return None
+        token_range = get_forward_context().additional_kwargs.get(
+            SHARDED_CP_TOKEN_RANGE_KEY
+        )
+        if token_range is not None and not isinstance(token_range, ShardedCPTokenRange):
+            raise RuntimeError(
+                "Sharded-CP MoE requires a ShardedCPTokenRange in the forward context."
+            )
+        return token_range
+
+    def _forward_sharded_cp(
+        self,
+        hidden_states: torch.Tensor,
+        token_range: ShardedCPTokenRange,
+    ) -> torch.Tensor:
+        if self.is_sequence_parallel:
+            raise RuntimeError(
+                "Sharded-CP MoE does not support sequence_parallel_moe yet."
+            )
+        if hidden_states.shape[0] != token_range.num_tokens:
+            raise ValueError(
+                "Sharded-CP MoE hidden rows must match the local token range: "
+                f"got {hidden_states.shape[0]}, expected {token_range.num_tokens}."
+            )
+
+        cp_group = get_sharded_cp_group()
+        if self.experts.is_internal_router:
+            global_hidden_states = all_gather_token_rows(
+                hidden_states, token_range, group=cp_group.device_group
+            )
+            global_router_logits = global_hidden_states
+        else:
+            router_logits, _ = self.gate(hidden_states)
+            # TODO(sharded-cp): gather quantized activations + scales instead
+            # of BF16 hidden states to reach the design's communication
+            # target; requires hooking FusedMoE's input quantization.
+            moe_inputs = all_gather_sharded_cp_moe_inputs(
+                hidden_states,
+                router_logits,
+                token_range,
+                group=cp_group.device_group,
+            )
+            global_hidden_states = moe_inputs.hidden_states
+            global_router_logits = moe_inputs.router_logits
+
+        final_hidden_states = self.experts(
+            hidden_states=global_hidden_states,
+            router_logits=global_router_logits,
+        )
+
+        return reduce_scatter_sharded_cp_moe_output(
+            final_hidden_states,
+            token_range,
+            group=cp_group.device_group,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -401,6 +478,16 @@ class DeepseekV2MoE(nn.Module):
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+
+        if self.use_sharded_cp_token_parallel:
+            token_range = self._maybe_get_sharded_cp_token_range()
+            if token_range is None:
+                raise RuntimeError(
+                    "enable_sharded_context_parallel is set but no Sharded-CP "
+                    "token range is active for this forward."
+                )
+            final_hidden_states = self._forward_sharded_cp(hidden_states, token_range)
+            return final_hidden_states.view(num_tokens, hidden_dim)
 
         # Chunk the hidden states so they aren't replicated across TP ranks.
         # This avoids duplicate computation in self.experts.
@@ -816,6 +903,103 @@ class Indexer(nn.Module):
 
         return self.indexer_op(hidden_states, q_fp8, k, weights)
 
+    def project_kw(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        rotary_emb,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Indexer-K rows and raw router weights from one fused GEMM.
+
+        Sharded-CP runs this before ``q`` exists so the compact-KV all-gather
+        can start early. The raw weights still need :meth:`scale_weights` once
+        the Q quantization scale is known.
+        """
+        kw, _ = self.wk_weights_proj(hidden_states)
+        k = self.k_norm(kw[:, : self.head_dim])
+        weights_raw = kw[:, self.head_dim :]
+        k_pe, k_nope = torch.split(
+            k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
+        )
+        # Rotation is identical for Q and K, so pass K through the query slot.
+        k_pe, _ = rotary_emb(positions, k_pe.unsqueeze(1), None)
+        k_pe = k_pe.reshape(-1, self.rope_dim)
+        return torch.cat([k_pe, k_nope], dim=-1), weights_raw
+
+    def project_q(
+        self,
+        qr: torch.Tensor,
+        positions: torch.Tensor,
+        rotary_emb,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantized indexer Q and its per-token-group scales."""
+        q, _ = self.wq_b(qr)
+        q = q.view(-1, self.n_head, self.head_dim)
+        q_pe, q_nope = torch.split(
+            q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
+        )
+        q_pe, _ = rotary_emb(positions, q_pe, None)
+        q_pe = q_pe.reshape(-1, self.n_head, self.rope_dim)
+        q = torch.cat([q_pe, q_nope], dim=-1)
+        q = q.view(-1, self.head_dim)
+        q_fp8, q_scale = per_token_group_quant_fp8(
+            q,
+            self.quant_block_size,
+            column_major_scales=False,
+            use_ue8m0=self.scale_fmt is not None,
+        )
+        q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
+        q_scale = q_scale.view(-1, self.n_head)
+        return q_fp8, q_scale
+
+    def scale_weights(
+        self,
+        weights_raw: torch.Tensor,
+        q_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        return weights_raw * q_scale * self.softmax_scale * self.n_head_scale
+
+    def forward_global_compact(
+        self,
+        hidden_states: torch.Tensor,
+        q_fp8: torch.Tensor,
+        indexer_k_global: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Score local Q against all-gathered global Indexer-K rows.
+
+        The Sharded-CP local metadata carries ``k_is_global_compact`` so the
+        indexer op skips the paged K-cache gather and insert.
+        """
+        return self.indexer_op(hidden_states, q_fp8, indexer_k_global, weights)
+
+    def update_local_k_cache(
+        self,
+        indexer_k: torch.Tensor,
+        layer_slot_mapping: torch.Tensor | None = None,
+    ) -> None:
+        """Quantize and persist Indexer-K rows with explicit slot IDs."""
+        forward_context = get_forward_context()
+        if forward_context.attn_metadata is None:
+            return
+        if layer_slot_mapping is None:
+            slot_mapping = forward_context.slot_mapping
+            assert isinstance(slot_mapping, dict), (
+                f"Expected slot_mapping to be a dict, got {type(slot_mapping)}. "
+            )
+            layer_slot_mapping = slot_mapping.get(self.k_cache.prefix)
+        if layer_slot_mapping is None or layer_slot_mapping.numel() == 0:
+            return
+        if layer_slot_mapping.shape[0] > indexer_k.shape[0]:
+            layer_slot_mapping = layer_slot_mapping[: indexer_k.shape[0]]
+        ops.indexer_k_quant_and_cache(
+            indexer_k[: layer_slot_mapping.shape[0]],
+            self.k_cache.kv_cache,
+            layer_slot_mapping,
+            self.quant_block_size,
+            self.scale_fmt,
+        )
+
 
 def _try_load_fp8_indexer_wk(
     name, tensor, buf, params_dict, loaded_params, pp_missing_layer_names
@@ -991,6 +1175,16 @@ class DeepseekV2MLAAttention(nn.Module):
         tp_size = get_tensor_model_parallel_world_size()
         assert num_heads % tp_size == 0
         self.num_local_heads = num_heads // tp_size
+        self.is_v32 = hasattr(config, "index_topk")
+        self.enable_sharded_context_parallel = (
+            vllm_config.parallel_config.enable_sharded_context_parallel
+        )
+        # Sharded-CP keeps all heads on every rank for its local token rows,
+        # so q_b_proj/kv_b_proj hold full logical weights (disable_tp below).
+        # o_proj stays TP-sharded via the all-to-all in mla.py.
+        self.use_sharded_cp_full_attention = (
+            self.enable_sharded_context_parallel and self.is_v32
+        )
 
         self.scaling = self.qk_head_dim**-0.5
         self.max_position_embeddings = max_position_embeddings
@@ -1022,6 +1216,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 self.num_heads * self.qk_head_dim,
                 bias=False,
                 quant_config=quant_config,
+                disable_tp=self.use_sharded_cp_full_attention,
                 prefix=f"{prefix}.q_b_proj",
             )
         else:
@@ -1030,6 +1225,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 self.num_heads * self.qk_head_dim,
                 bias=False,
                 quant_config=quant_config,
+                disable_tp=self.use_sharded_cp_full_attention,
                 prefix=f"{prefix}.q_proj",
             )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
@@ -1038,13 +1234,20 @@ class DeepseekV2MLAAttention(nn.Module):
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
             quant_config=quant_config,
+            disable_tp=self.use_sharded_cp_full_attention,
             prefix=f"{prefix}.kv_b_proj",
         )
         self.o_proj = RowParallelLinear(
             self.num_heads * self.v_head_dim,
             self.hidden_size,
             bias=False,
-            reduce_results=reduce_results,
+            # Sharded-CP converts attention output to the TP head layout with
+            # an all-to-all, so o_proj keeps its normal TP-sharded weight. The
+            # TP reduction is folded into the reduce-scatter that returns to
+            # CP-local rows (see mla.py::_sharded_cp_o_proj).
+            reduce_results=(
+                reduce_results and not self.use_sharded_cp_full_attention
+            ),
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
@@ -1071,8 +1274,6 @@ class DeepseekV2MLAAttention(nn.Module):
             scaling_factor = config.rope_parameters["factor"]
             mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
             self.scaling = self.scaling * mscale * mscale
-
-        self.is_v32 = hasattr(config, "index_topk")
 
         # IndexCache config
         # Refer: https://arxiv.org/abs/2603.12201 for more details.
@@ -1142,11 +1343,14 @@ class DeepseekV2MLAAttention(nn.Module):
             indexer_rotary_emb=self.indexer_rope_emb,
             is_sparse=self.is_v32,
             topk_indices_buffer=topk_indices_buffer,
+            enable_sharded_context_parallel=self.use_sharded_cp_full_attention,
         )
 
         self.mla_attn = MultiHeadLatentAttentionWrapper(
             self.hidden_size,
-            self.num_local_heads,
+            self.num_heads
+            if self.use_sharded_cp_full_attention
+            else self.num_local_heads,
             self.scaling,
             self.qk_nope_head_dim,
             self.qk_rope_head_dim,
@@ -1261,6 +1465,11 @@ class DeepseekV2DecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                # Sharded-CP hidden states are token-sharded like SP: dense
+                # MLP runs per-token on full logical weights.
+                is_sequence_parallel=(
+                    parallel_config.enable_sharded_context_parallel
+                ),
                 prefix=f"{prefix}.mlp",
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1268,6 +1477,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
+        self.enable_sharded_context_parallel = (
+            parallel_config.enable_sharded_context_parallel
+        )
 
     def forward(
         self,
@@ -1357,6 +1569,10 @@ class DeepseekV2Model(nn.Module):
         self.hidden_size = config.hidden_size
         self.vocab_size = config.vocab_size
         self.is_v32 = hasattr(config, "index_topk")
+        self.enable_sharded_context_parallel = (
+            vllm_config.parallel_config.enable_sharded_context_parallel
+        )
+        self.sharded_cp_token_range: ShardedCPTokenRange | None = None
         if self.is_v32:
             topk_tokens = config.index_topk
             topk_indices_buffer = torch.empty(
@@ -1410,6 +1626,49 @@ class DeepseekV2Model(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    def _maybe_scatter_to_sharded_cp(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        *,
+        reduce_hidden_states: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Move global token rows into this rank's CP-local layout.
+
+        ``reduce_hidden_states`` selects between reduce-scatter (embedding
+        output still carries per-TP-rank partial sums) and plain slicing
+        (already-reduced ``inputs_embeds``).
+        """
+        if not self.enable_sharded_context_parallel:
+            self.sharded_cp_token_range = None
+            return hidden_states, positions
+
+        if not is_forward_context_available():
+            raise RuntimeError(
+                "enable_sharded_context_parallel requires a Sharded-CP "
+                "forward context."
+            )
+        token_range = get_forward_context().additional_kwargs.get(
+            SHARDED_CP_TOKEN_RANGE_KEY
+        )
+        if token_range is None:
+            raise RuntimeError(
+                "enable_sharded_context_parallel is set but no Sharded-CP "
+                "token range is active for this forward."
+            )
+        self.sharded_cp_token_range = token_range
+        cp_group = get_sharded_cp_group()
+        if reduce_hidden_states:
+            hidden_states = reduce_scatter_token_rows(
+                hidden_states,
+                token_range,
+                group=cp_group.device_group,
+            )
+        else:
+            hidden_states = hidden_states[token_range.start : token_range.end]
+        positions = positions[token_range.start : token_range.end]
+        return hidden_states, positions
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -1418,6 +1677,7 @@ class DeepseekV2Model(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         if get_pp_group().is_first_rank:
+            reduce_hidden_states = False
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
@@ -1426,7 +1686,16 @@ class DeepseekV2Model(nn.Module):
                         "Either input_ids or inputs_embeds must be provided "
                         "to DeepseekV2Model.forward"
                     )
-                hidden_states = self.embed_input_ids(input_ids)
+                if self.enable_sharded_context_parallel:
+                    hidden_states = self.embed_tokens.forward_parallel(input_ids)
+                    reduce_hidden_states = True
+                else:
+                    hidden_states = self.embed_input_ids(input_ids)
+            hidden_states, positions = self._maybe_scatter_to_sharded_cp(
+                hidden_states,
+                positions,
+                reduce_hidden_states=reduce_hidden_states,
+            )
             residual = None
         else:
             assert intermediate_tensors is not None
@@ -1456,6 +1725,7 @@ class DeepseekV2Model(nn.Module):
             if (
                 hidden_states.shape[0] != positions.shape[0]
                 and not layer.use_sequence_parallel_moe
+                and self.sharded_cp_token_range is None
             ):
                 combined_states = torch.cat([hidden_states, residual], dim=-1)
                 combined_states = tensor_model_parallel_all_gather(combined_states, 0)
@@ -1467,7 +1737,10 @@ class DeepseekV2Model(nn.Module):
                 residual = residual.contiguous()
             if idx in self.aux_hidden_state_layers:
                 aux_hidden_state = hidden_states + residual
-                if aux_hidden_state.shape[0] != positions.shape[0]:
+                if (
+                    aux_hidden_state.shape[0] != positions.shape[0]
+                    and self.sharded_cp_token_range is None
+                ):
                     aux_hidden_state = tensor_model_parallel_all_gather(
                         aux_hidden_state, 0
                     )
@@ -1889,8 +2162,35 @@ class DeepseekV2ForCausalLM(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
+        hidden_states = self.prepare_hidden_states_for_logits(hidden_states)
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
+
+    def prepare_hidden_states_for_logits(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """All-gather CP-local hidden rows back to the global TP layout.
+
+        Idempotent per forward: the first call consumes the token range set
+        by the model forward, so later calls (e.g. compute_logits after the
+        runner already prepared the rows) pass through unchanged.
+        """
+        if not self.model.enable_sharded_context_parallel:
+            return hidden_states
+
+        token_range = self.model.sharded_cp_token_range
+        if token_range is None:
+            return hidden_states
+
+        cp_group = get_sharded_cp_group()
+        hidden_states = all_gather_token_rows(
+            hidden_states,
+            token_range,
+            group=cp_group.device_group,
+        )
+        self.model.sharded_cp_token_range = None
+        return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales

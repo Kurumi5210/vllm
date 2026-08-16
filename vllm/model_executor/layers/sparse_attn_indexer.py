@@ -292,6 +292,100 @@ def kv_cache_as_quant_view(
     return kv_cache.unsqueeze(-2)
 
 
+def _fill_topk_from_global_compact_k(
+    *,
+    q_quant: torch.Tensor,
+    q_scale: torch.Tensor | None,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    attn_metadata: DeepseekV32IndexerMetadata,
+    quant_block_size: int,
+    scale_fmt: str | None,
+    topk_tokens: int,
+    topk_indices_buffer: torch.Tensor,
+) -> torch.Tensor:
+    """Sharded-CP pure prefill: score against all-gathered global compact K.
+
+    ``k`` holds the global ``[T, head_dim]`` Indexer-K rows and each prefill
+    chunk's ``cu_seqlen_ks/ke`` are global token-row spans, so no paged
+    K-cache gather is needed. Selected indices are remapped from span-local
+    to global row offsets before being written to the shared buffer.
+    """
+    if attn_metadata.num_prefills == 0 or attn_metadata.prefill is None:
+        return topk_indices_buffer
+    if k.dim() != 2:
+        raise RuntimeError(
+            "Sharded-CP global compact Indexer-K must be a 2D tensor, got "
+            f"{tuple(k.shape)}."
+        )
+    if q_scale is not None:
+        raise RuntimeError(
+            "Sharded-CP global compact KV does not support the FP4 indexer "
+            "cache yet."
+        )
+
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        per_token_group_quant_fp8,
+    )
+
+    k_quant, k_scale = per_token_group_quant_fp8(
+        k.contiguous(),
+        quant_block_size,
+        column_major_scales=False,
+        use_ue8m0=scale_fmt is not None,
+    )
+    k_scale = k_scale.view(torch.float32).squeeze(-1)
+
+    for chunk in attn_metadata.prefill.chunks:
+        if chunk.token_end <= chunk.token_start:
+            continue
+        topk_indices = topk_indices_buffer[
+            chunk.token_start : chunk.token_end, :topk_tokens
+        ]
+        topk_indices.fill_(-1)
+        q_slice = q_quant[chunk.token_start : chunk.token_end]
+        weights_slice = weights[chunk.token_start : chunk.token_end]
+        if current_platform.is_xpu():
+            logits = torch.ops.vllm.xpu_fp8_mqa_logits(
+                q_slice,
+                k_quant,
+                k_scale,
+                weights_slice,
+                chunk.cu_seqlen_ks,
+                chunk.cu_seqlen_ke,
+            )
+        else:
+            logits = fp8_fp4_mqa_logits(
+                (q_slice, None),
+                (k_quant, k_scale),
+                weights_slice,
+                chunk.cu_seqlen_ks,
+                chunk.cu_seqlen_ke,
+                clean_logits=False,
+            )
+        num_rows = logits.shape[0]
+        ops.top_k_per_row_prefill(
+            logits,
+            chunk.cu_seqlen_ks,
+            chunk.cu_seqlen_ke,
+            topk_indices,
+            num_rows,
+            logits.stride(0),
+            logits.stride(1),
+            topk_tokens,
+        )
+        valid_topk = topk_indices >= 0
+        topk_indices.copy_(
+            torch.where(
+                valid_topk,
+                topk_indices + chunk.cu_seqlen_ks.unsqueeze(1),
+                topk_indices,
+            )
+        )
+
+    return topk_indices_buffer
+
+
 @eager_break_during_capture
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
@@ -372,6 +466,19 @@ def sparse_attn_indexer(
         assert q_scale is not None, "use_fp4_cache=True requires q_scale"
     else:
         assert q_scale is None, "q_scale must be None when use_fp4_cache=False"
+
+    if attn_metadata_narrowed.k_is_global_compact:
+        return _fill_topk_from_global_compact_k(
+            q_quant=q_quant,
+            q_scale=q_scale,
+            k=k,
+            weights=weights,
+            attn_metadata=attn_metadata_narrowed,
+            quant_block_size=quant_block_size,
+            scale_fmt=scale_fmt,
+            topk_tokens=topk_tokens,
+            topk_indices_buffer=topk_indices_buffer,
+        )
 
     # During speculative decoding, k may be padded to the CUDA graph batch
     # size while slot_mapping only covers actual tokens. Truncate k to avoid

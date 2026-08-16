@@ -50,8 +50,14 @@ from vllm.distributed.parallel_state import (
     is_global_first_rank,
     prepare_communication_buffer_for_model,
 )
+from vllm.distributed.sharded_cp_utils import (
+    ShardedCPTokenRange,
+    get_sharded_cp_group,
+    get_sharded_cp_token_range,
+)
 from vllm.forward_context import (
     BatchDescriptor,
+    get_forward_context,
     set_forward_context,
 )
 from vllm.logger import init_logger
@@ -143,6 +149,14 @@ from vllm.v1.attention.backends.linear_attn import (
     BailingLinearAttentionMetadataBuilder,
 )
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
+from vllm.v1.attention.backends.mla.sharded_cp_metadata import (
+    annotate_token_range_with_request_fragments,
+    apply_global_compact_kv_overrides,
+    localize_common_attention_metadata,
+    sharded_cp_forward_context,
+    supports_global_compact_kv,
+    use_global_compact_kv_for_batch,
+)
 from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
     create_fast_prefill_custom_backend,
@@ -2277,6 +2291,9 @@ class GPUModelRunner(
         Returns:
             tuple[attn_metadata, spec_decode_common_attn_metadata]
         """
+        self._sharded_cp_run_state: (
+            tuple[ShardedCPTokenRange, dict[str, Any], bool] | None
+        ) = None
         # Attention metadata is not needed for attention free models
         if len(self.kv_cache_config.kv_cache_groups) == 0:
             return {}, None
@@ -2527,6 +2544,26 @@ class GPUModelRunner(
 
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
+        build_sharded_cp = (
+            self.parallel_config.enable_sharded_context_parallel
+            and not for_cudagraph_capture
+            and ubatch_slices is None
+        )
+        sharded_cp_token_range: ShardedCPTokenRange | None = None
+        sharded_cp_local_builds: list[
+            tuple[Any, CommonAttentionMetadata, list[str]]
+        ] = []
+        if build_sharded_cp:
+            cp_group = get_sharded_cp_group()
+            sharded_cp_token_range = annotate_token_range_with_request_fragments(
+                get_sharded_cp_token_range(
+                    int(cm_base.query_start_loc_cpu[-1].item()),
+                    cp_group.rank_in_group,
+                    cp_group.world_size,
+                ),
+                cm_base.query_start_loc_cpu,
+            )
+
         spec_decode_common_attn_metadata = None
         for kv_cache_gid, kv_cache_group in enumerate(kv_cache_groups):
             cm = copy(cm_base)  # shallow copy
@@ -2574,6 +2611,28 @@ class GPUModelRunner(
 
                 else:
                     _build_attn_group_metadata(kv_cache_gid, attn_gid, cm)
+
+            if build_sharded_cp and sharded_cp_token_range.num_tokens > 0:
+                local_cm = localize_common_attention_metadata(
+                    cm, sharded_cp_token_range
+                )
+                for attn_group in self.attn_groups[kv_cache_gid]:
+                    local_builder = attn_group.get_metadata_builder(0)
+                    local_md = local_builder.build(
+                        common_prefix_len=0,
+                        common_attn_metadata=local_cm,
+                    )
+                    sharded_cp_local_builds.append(
+                        (local_md, local_cm, list(attn_group.layer_names))
+                    )
+
+        if build_sharded_cp:
+            assert sharded_cp_token_range is not None
+            self._sharded_cp_run_state = self._finalize_sharded_cp_run_state(
+                sharded_cp_token_range,
+                sharded_cp_local_builds,
+                pure_prefill=use_global_compact_kv_for_batch(cm_base),
+            )
 
         if spec_decode_common_attn_metadata is not None and (
             num_reqs != num_reqs_padded or num_tokens != num_tokens_padded
@@ -3853,6 +3912,101 @@ class GPUModelRunner(
             **model_kwargs,
         )
 
+    def _validate_sharded_cp_attn_backends(self) -> None:
+        """Reject auto-selected backends without Sharded-CP support.
+
+        Config validation only covers explicitly requested backends; this is
+        the re-validation for backends resolved at runtime.
+        """
+        supported = {"FLASHMLA_SPARSE", "DEEPSEEK_V32_INDEXER"}
+        for group in self._attn_group_iterator():
+            name = group.backend.get_name()
+            if name not in supported:
+                raise ValueError(
+                    "enable_sharded_context_parallel does not support the "
+                    f"auto-selected attention backend {name} (layers "
+                    f"{group.layer_names[:2]}...). Supported backends: "
+                    f"{sorted(supported)}."
+                )
+
+    @contextmanager
+    def _maybe_sharded_cp_forward_context(self) -> Iterator[None]:
+        """Run the model under CP-local attention metadata, if prepared.
+
+        The run state is produced by ``_build_attention_metadata`` for every
+        real and dummy forward when Sharded-CP is enabled.
+        """
+        run_state = getattr(self, "_sharded_cp_run_state", None)
+        if run_state is None:
+            if self.parallel_config.enable_sharded_context_parallel:
+                raise RuntimeError(
+                    "enable_sharded_context_parallel requires Sharded-CP "
+                    "run state; attention metadata was not built for this "
+                    "forward."
+                )
+            yield
+            return
+        token_range, local_attn_metadata, use_global_compact_kv = run_state
+        with sharded_cp_forward_context(
+            get_forward_context(),
+            token_range,
+            local_attn_metadata,
+            use_global_compact_kv=use_global_compact_kv,
+        ):
+            yield
+
+    def _finalize_sharded_cp_run_state(
+        self,
+        token_range: ShardedCPTokenRange,
+        local_builds: list[tuple[Any, CommonAttentionMetadata, list[str]]],
+        pure_prefill: bool,
+    ) -> tuple[ShardedCPTokenRange, dict[str, Any], bool]:
+        use_global_compact_kv = pure_prefill and all(
+            supports_global_compact_kv(local_md) for local_md, _, _ in local_builds
+        )
+        local_attn_metadata: dict[str, Any] = {}
+        for local_md, local_cm, layer_names in local_builds:
+            if use_global_compact_kv:
+                local_md = apply_global_compact_kv_overrides(
+                    local_md, token_range, local_cm
+                )
+            for layer_name in layer_names:
+                local_attn_metadata[layer_name] = local_md
+        return token_range, local_attn_metadata, use_global_compact_kv
+
+    def _prepare_hidden_states_for_logits(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        prepare_hidden_states = getattr(
+            self.model, "prepare_hidden_states_for_logits", None
+        )
+        if prepare_hidden_states is None:
+            return hidden_states
+        return prepare_hidden_states(hidden_states)
+
+    def _select_hidden_states_for_logits(
+        self,
+        hidden_states: torch.Tensor,
+        logits_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Restore global token rows (Sharded-CP) before indexing logits."""
+        hidden_states = self._prepare_hidden_states_for_logits(hidden_states)
+        return hidden_states, hidden_states[logits_indices]
+
+    @contextmanager
+    def _temporary_sharded_cp_kv_cache(self, should_init: bool) -> Iterator[None]:
+        if not should_init:
+            yield
+            return
+
+        with set_current_vllm_config(self.vllm_config):
+            self._init_minimal_kv_cache_for_profiling()
+        try:
+            yield
+        finally:
+            self._cleanup_profiling_kv_cache()
+
     @staticmethod
     def _is_uniform_decode(
         max_num_scheduled_tokens: int,
@@ -4391,13 +4545,14 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
+            with self._maybe_sharded_cp_forward_context():
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4425,14 +4580,18 @@ class GPUModelRunner(
                         kv_connector_output,
                     )
 
-                sample_hidden_states = hidden_states[logits_indices]
+                hidden_states, sample_hidden_states = (
+                    self._select_hidden_states_for_logits(
+                        hidden_states, logits_indices
+                    )
+                )
                 logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
 
-                sample_hidden_states = hidden_states[logits_indices]
                 if not get_pp_group().is_last_rank:
+                    sample_hidden_states = hidden_states[logits_indices]
                     all_gather_tensors = {
                         "residual": not is_residual_scattered_for_sp(
                             self.vllm_config, num_tokens_padded
@@ -4445,6 +4604,11 @@ class GPUModelRunner(
                     )
                     logits = None
                 else:
+                    hidden_states, sample_hidden_states = (
+                        self._select_hidden_states_for_logits(
+                            hidden_states, logits_indices
+                        )
+                    )
                     logits = self.model.compute_logits(sample_hidden_states)
 
                 model_output_broadcast_data: dict[str, Any] = {}
@@ -5765,6 +5929,22 @@ class GPUModelRunner(
 
     @torch.inference_mode()
     def _dummy_run(
+        self, num_tokens: int, **kwargs
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.parallel_config.enable_sharded_context_parallel:
+            return self._dummy_run_impl(num_tokens, **kwargs)
+
+        # Sharded-CP layers fail closed without CP-local attention metadata,
+        # so every dummy pass must build it. During memory profiling the KV
+        # cache does not exist yet (kv_cache_config is only set by
+        # initialize_kv_cache); create a temporary minimal cache so metadata
+        # builders and cache-write kernels have real tensors to work with.
+        kwargs["force_attention"] = True
+        init_temp_kv_cache = not hasattr(self, "kv_cache_config")
+        with self._temporary_sharded_cp_kv_cache(init_temp_kv_cache):
+            return self._dummy_run_impl(num_tokens, **kwargs)
+
+    def _dummy_run_impl(
         self,
         num_tokens: int,
         cudagraph_runtime_mode: CUDAGraphMode | None = None,
@@ -6081,13 +6261,14 @@ class GPUModelRunner(
                     slot_mapping=slot_mappings,
                 ),
             ):
-                outputs = self.model(
-                    input_ids=input_ids,
-                    positions=positions,
-                    intermediate_tensors=intermediate_tensors,
-                    inputs_embeds=inputs_embeds,
-                    **model_kwargs,
-                )
+                with self._maybe_sharded_cp_forward_context():
+                    outputs = self.model(
+                        input_ids=input_ids,
+                        positions=positions,
+                        intermediate_tensors=intermediate_tensors,
+                        inputs_embeds=inputs_embeds,
+                        **model_kwargs,
+                    )
 
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
@@ -6164,7 +6345,9 @@ class GPUModelRunner(
         logit_indices_device = torch.from_numpy(logit_indices).to(
             self.device, non_blocking=True
         )
-        return hidden_states, hidden_states[logit_indices_device]
+        return self._select_hidden_states_for_logits(
+            hidden_states, logit_indices_device
+        )
 
     @torch.inference_mode()
     def _dummy_sampler_run(
@@ -7057,6 +7240,8 @@ class GPUModelRunner(
         """
         Create the metadata builders for all KV cache groups and attn groups.
         """
+        if self.parallel_config.enable_sharded_context_parallel:
+            self._validate_sharded_cp_attn_backends()
         for kv_cache_group_id in range(len(kv_cache_config.kv_cache_groups)):
             for attn_group in self.attn_groups[kv_cache_group_id]:
                 attn_group.create_metadata_builders(

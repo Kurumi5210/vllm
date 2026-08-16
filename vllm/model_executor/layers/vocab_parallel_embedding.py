@@ -469,7 +469,12 @@ class VocabParallelEmbedding(PluggableLayer):
         param[: loaded_weight.shape[0]].data.copy_(loaded_weight)
         param[loaded_weight.shape[0] :].data.fill_(0)
 
-    def forward(self, input_):
+    def forward_parallel(self, input_):
+        """Return this TP rank's local contribution, before TP reduction.
+
+        The Sharded-CP path reduces token rows with a reduce-scatter instead
+        of the all-reduce in :meth:`forward`.
+        """
         if self.tp_size > 1:
             # Build the mask.
             masked_input, input_mask = get_masked_input_and_mask(
@@ -487,6 +492,10 @@ class VocabParallelEmbedding(PluggableLayer):
         # Mask the output embedding.
         if self.tp_size > 1:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
+        return output_parallel
+
+    def forward(self, input_):
+        output_parallel = self.forward_parallel(input_)
         # Reduce across all the model parallel GPUs.
         output = tensor_model_parallel_all_reduce(output_parallel)
         return output

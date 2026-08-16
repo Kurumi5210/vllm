@@ -2093,6 +2093,15 @@ def destroy_model_parallel():
         _EPLB.destroy()
     _EPLB = None
 
+    # Sharded-CP caches side streams in a module-level dict; drop them so an
+    # in-process re-initialization starts clean. Probe sys.modules instead of
+    # importing (the module is only loaded when the feature was used).
+    import sys
+
+    sharded_cp_utils = sys.modules.get("vllm.distributed.sharded_cp_utils")
+    if sharded_cp_utils is not None:
+        sharded_cp_utils.destroy_sharded_cp_comm_resources()
+
 
 def destroy_distributed_environment():
     global _WORLD, _NODE_COUNT

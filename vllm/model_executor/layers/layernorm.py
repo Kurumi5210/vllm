@@ -77,6 +77,11 @@ class RMSNorm(CustomOp):
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward()."""
+        if 0 in x.shape[:-1]:
+            # Sharded-CP ranks can own zero token rows for a step.
+            if residual is None:
+                return x
+            return x, residual
         if residual is None:
             return ir.ops.rms_norm(
                 x,
@@ -98,6 +103,10 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if 0 in x.shape[:-1]:
+            if residual is None:
+                return x
+            return x, residual
         if envs.VLLM_BATCH_INVARIANT:
             assert self.variance_size_override is None, (
                 "Batch invariance is not supported for variance_size_override"
