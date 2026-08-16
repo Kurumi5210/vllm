@@ -26,6 +26,9 @@ from vllm.distributed.sharded_cp_utils import (
 )
 from vllm.forward_context import ForwardContext, override_forward_context
 from vllm.v1.attention.backend import AttentionMetadata, CommonAttentionMetadata
+from vllm.v1.attention.backends.mla.flashattn_mla_sparse import (
+    FlashAttnMLASparseMetadata,
+)
 from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseMetadata
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 from vllm.v1.worker.ubatch_utils import UBatchSlice, _make_metadata_with_slice
@@ -219,7 +222,14 @@ def supports_global_compact_kv(metadata: AttentionMetadata) -> bool:
     caller must fall back to the paged-KV path when any metadata object is
     not recognized here.
     """
-    return isinstance(metadata, (DeepseekV32IndexerMetadata, FlashMLASparseMetadata))
+    return isinstance(
+        metadata,
+        (
+            DeepseekV32IndexerMetadata,
+            FlashMLASparseMetadata,
+            FlashAttnMLASparseMetadata,
+        ),
+    )
 
 
 def apply_global_compact_kv_overrides(
@@ -250,6 +260,10 @@ def apply_global_compact_kv_overrides(
         metadata.topk_indices_are_global_compact_offsets = True
         metadata.fp8_extra_metadata = None
         metadata.fp8_use_mixed_batch = False
+        return metadata
+
+    if isinstance(metadata, FlashAttnMLASparseMetadata):
+        metadata.topk_indices_are_global_compact_offsets = True
         return metadata
 
     return metadata

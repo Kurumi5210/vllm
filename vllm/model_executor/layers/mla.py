@@ -305,25 +305,26 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
                 kv_c_global, k_pe_global, indexer_k_global
             )
 
-            if use_global_compact_kv:
-                if self.indexer is not None and not self.skip_topk:
-                    assert indexer_weights_raw is not None
-                    q_fp8, q_scale = self.indexer.project_q(
-                        q_c, positions, self.indexer_rope_emb
-                    )
-                    indexer_weights = self.indexer.scale_weights(
-                        indexer_weights_raw, q_scale
-                    )
+            if self.indexer is not None and not self.skip_topk:
+                assert indexer_weights_raw is not None
+                q_fp8, q_scale = self.indexer.project_q(
+                    q_c, positions, self.indexer_rope_emb
+                )
+                indexer_weights = self.indexer.scale_weights(
+                    indexer_weights_raw, q_scale
+                )
+                if use_global_compact_kv:
                     self.indexer.forward_global_compact(
                         hidden_states, q_fp8, indexer_k_global, indexer_weights
                     )
-            elif self.indexer is not None and not self.skip_topk:
-                self.indexer(
-                    hidden_states,
-                    q_c,
-                    positions,
-                    self.indexer_rope_emb,
-                )
+                else:
+                    # Score against the paged cache, which already holds every
+                    # global row from _write_sharded_cp_global_caches. Reusing
+                    # project_kw/project_q here avoids recomputing the fused
+                    # wk GEMM and re-inserting the same rows into the cache.
+                    self.indexer.forward_local_paged(
+                        hidden_states, q_fp8, indexer_weights
+                    )
         except Exception:
             if compact_kv_handle is not None:
                 compact_kv_handle.release()

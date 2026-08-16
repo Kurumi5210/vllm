@@ -135,6 +135,11 @@ class FlashAttnMLASparseMetadata(AttentionMetadata):
     prefill_max_seq_len: int = 0
     prefill: MLACommonPrefillMetadata | None = None
     cp_kv_cache_interleave_size: int = 1
+    # Sharded-CP pure prefill: top-k indices already address rows of the
+    # all-gathered global compact KV, so no per-request conversion is needed
+    # and the KV argument is a contiguous [num_tokens, head_size] buffer
+    # rather than the paged cache.
+    topk_indices_are_global_compact_offsets: bool = False
 
 
 class FlashAttnMLASparseMetadataBuilder(
@@ -223,25 +228,30 @@ class FlashAttnMLASparseImpl(SparseMLACommonImpl[FlashAttnMLASparseMetadata]):
 
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
-        topk_indices, valid_counts = triton_convert_req_index_to_global_index(
-            attn_metadata.req_id_per_token[:num_actual_toks],
-            attn_metadata.block_table,
-            topk_indices,
-            BLOCK_SIZE=attn_metadata.block_size,
-            NUM_TOPK_TOKENS=topk_indices.shape[1],
-            return_valid_counts=True,
-        )
+        if attn_metadata.topk_indices_are_global_compact_offsets:
+            # Indices are row offsets into the gathered compact KV buffer.
+            valid_counts = (topk_indices >= 0).sum(dim=1, dtype=torch.int32)
+        else:
+            topk_indices, valid_counts = triton_convert_req_index_to_global_index(
+                attn_metadata.req_id_per_token[:num_actual_toks],
+                attn_metadata.block_table,
+                topk_indices,
+                BLOCK_SIZE=attn_metadata.block_size,
+                NUM_TOPK_TOKENS=topk_indices.shape[1],
+                return_valid_counts=True,
+            )
 
         cu_seqlens_q = torch.arange(
             0, num_actual_toks + 1, dtype=torch.int32, device=q_rope.device
         )
-        kv_cache = kv_c_and_k_pe_cache.view(
-            -1, attn_metadata.block_size, self.head_size
-        )
-        k_cache = kv_cache[:, :, self.kv_lora_rank :].view(
+        # The block grouping below is a reshape round trip: k/v end up viewed
+        # at single-slot granularity, so a contiguous [tokens, head_size]
+        # buffer works as-is and avoids requiring block_size divisibility.
+        kv_rows = kv_c_and_k_pe_cache.view(-1, self.head_size)
+        k_cache = kv_rows[:, self.kv_lora_rank :].view(
             -1, 1, 1, self.qk_rope_head_dim
         )
-        v_cache = kv_cache[:, :, : self.kv_lora_rank].view(-1, 1, 1, self.kv_lora_rank)
+        v_cache = kv_rows[:, : self.kv_lora_rank].view(-1, 1, 1, self.kv_lora_rank)
 
         out = flash_attn_varlen_func(
             q=q_rope,
