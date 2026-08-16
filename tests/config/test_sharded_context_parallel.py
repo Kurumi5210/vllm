@@ -64,15 +64,25 @@ def test_parallel_config_accepts_sharded_cp_minimum_topology():
             {"tensor_parallel_size": 2, "data_parallel_size": 2},
             "data parallelism",
         ),
-        (
-            {"tensor_parallel_size": 2, "enable_expert_parallel": True},
-            "expert parallelism",
-        ),
     ],
 )
 def test_parallel_config_rejects_sharded_cp_incompatible_topology(kwargs, match):
     with pytest.raises(ValueError, match=match):
         ParallelConfig(enable_sharded_context_parallel=True, **kwargs)
+
+
+def test_parallel_config_accepts_sharded_cp_with_expert_parallel():
+    """EP is required to deploy a 256-expert MoE and is safe here: CP already
+    rejects DP/PCP/SP-MoE, so FusedMoE takes the late-all-reduce path and the
+    CP reduce-scatter completes the expert reduction."""
+    config = ParallelConfig(
+        tensor_parallel_size=2,
+        enable_expert_parallel=True,
+        enable_sharded_context_parallel=True,
+    )
+
+    assert config.enable_expert_parallel is True
+    assert config.use_sequence_parallel_moe is False
 
 
 def _make_sharded_cp_vllm_config_for_validation(

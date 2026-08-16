@@ -65,6 +65,7 @@ from vllm.model_executor.layers.fused_moe import (
 from vllm.model_executor.layers.fused_moe.sharded_cp_moe import (
     all_gather_sharded_cp_moe_inputs,
     reduce_scatter_sharded_cp_moe_output,
+    slice_sharded_cp_moe_output,
 )
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -471,6 +472,17 @@ class DeepseekV2MoE(nn.Module):
             router_logits=global_router_logits,
         )
 
+        # FusedMoE only honors reduce_results=False on the late-all-reduce
+        # path (see fused_moe/layer.py::skip_final_all_reduce). When it did
+        # skip its all-reduce, each rank holds a partial sum over the experts
+        # it owns, so the reduce-scatter both completes that reduction and
+        # returns to CP-local rows. When it did not, every rank already holds
+        # the fully reduced result and reducing again would scale the output
+        # by the CP world size, so we only take our rows.
+        moe_config = getattr(self.experts, "moe_config", None)
+        output_is_reduced = not getattr(moe_config, "skip_final_all_reduce", False)
+        if output_is_reduced:
+            return slice_sharded_cp_moe_output(final_hidden_states, token_range)
         return reduce_scatter_sharded_cp_moe_output(
             final_hidden_states,
             token_range,

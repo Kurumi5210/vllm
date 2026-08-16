@@ -793,6 +793,21 @@ chosen after reviewing the original research branch:
   local MLA and indexer caches with global slot IDs (including ranks that own
   zero rows). This keeps caches complete even when request-to-rank assignment
   shifts between steps.
+- **Expert parallelism is supported and expected.** A 256-expert MoE cannot
+  be deployed without it (vllm-ascend's DSA-CP even asserts
+  `enable_expert_parallel=True` for MoE models). With CP's constraints
+  (DP=1, PCP=1, no SP-MoE) `FusedMoEParallelConfig.use_all2all_kernels` is
+  False, so EP takes the naive path: every rank must see every token and
+  contributes a partial sum over the experts it owns. That is why the CP MoE
+  path all-gathers the rows before the experts and reduce-scatters after --
+  the reduce-scatter completes exactly that expert reduction. The MoE path
+  also checks `moe_config.skip_final_all_reduce`: if FusedMoE did not honor
+  `reduce_results=False` its output is already reduced, and reducing again
+  would scale it by the CP world size, so those rows are only sliced.
+  vllm-ascend instead runs the experts directly on CP-local rows, which is
+  possible because its DSA-CP requires sequence parallelism and therefore
+  gets real all-to-all dispatch; reaching that would let us drop the
+  pre-MoE gather entirely.
 - **Fail-closed scope.** v1 requires `--enforce-eager` (Shard Linear swaps
   parameter storage per layer, which torch.compile and CUDA graphs cannot
   handle), `data_parallel_size=1`, no expert parallelism, no speculative
