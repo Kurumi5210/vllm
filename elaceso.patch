@@ -1,0 +1,2397 @@
+diff --git a/bamboo/project_pactum/agent/api.py b/bamboo/project_pactum/agent/api.py
+index 45c1ceb53171b2216ce1b91b9e1167e46686fa63..047f91133a8168b205955813325bc1219096ac0b 100644
+--- a/bamboo/project_pactum/agent/api.py
++++ b/bamboo/project_pactum/agent/api.py
+@@ -42,6 +42,7 @@ from torch.distributed.elastic.utils.logging import get_logger
+ from torch.distributed.elastic.metrics import put_metric
+ 
+ from project_pactum.agent.worker import ProjectPactumWorker
++from project_pactum.rendezvous.rank_mapping import should_start_scale_out
+ from torch.distributed.elastic.agent.server.api import WorkerSpec
+ 
+ DEFAULT_ROLE = "default"
+@@ -104,6 +105,23 @@ class ProjectPactumAgent(SimpleElasticAgent):
+         print(Fore.RED + "ABOUT TO DIE!!!" + Fore.RESET)
+         os.kill(os.getpid(), 9)
+ 
++    def _stop_for_planned_removal(self, role: str) -> RunResult:
++        group_rank = self._worker_group.group_rank
++        log.info(
++            f"[{role}] stopping worker group for planned removal "
++            f"of agent rank {group_rank}"
++        )
++        self._stop_workers()
++        self._worker_group.state = WorkerState.STOPPED
++        return RunResult(state=WorkerState.STOPPED)
++
++    def _record_worker_events(self, result: RunResult) -> None:
++        # TorchElastic cannot infer a terminal event for workers deliberately
++        # stopped by the agent: STOPPED has neither return values nor failures.
++        if result.state == WorkerState.STOPPED:
++            return
++        return super()._record_worker_events(result)
++
+     def _make_log_dir(self, log_dir: Optional[str], rdzv_run_id: str):
+         base_log_dir = log_dir or tempfile.mkdtemp(prefix="torchelastic_")
+         os.makedirs(base_log_dir, exist_ok=True)
+@@ -320,16 +338,10 @@ class ProjectPactumAgent(SimpleElasticAgent):
+             ## Check if a simulated failure happens:
+             simulate_failure = rdzv_handler.get(f"simulate_failure_node{self._worker_group.group_rank}")
+             if simulate_failure == "1":
+-                self._stop_workers()
+-                return None
++                return self._stop_for_planned_removal(role)
+ 
+             ## NOTE: check if any worker has marked "should_reconfigure" and do the rendezvous
+             num_nodes_waiting = rdzv_handler.num_nodes_waiting()
+-            if num_nodes_waiting > 0:
+-            # if rdzv_handler.num_nodes_waiting() > 0:
+-                if self._worker_group.group_rank == 0:
+-                    rdzv_handler.write("scale_out", "1")
+-
+             try:
+                 reconfig_flag = rdzv_handler.get("should_reconfigure")
+             except:
+@@ -348,7 +360,37 @@ class ProjectPactumAgent(SimpleElasticAgent):
+             # else:
+             #     failed_rank = -1
+ 
+-            if failed_rank >= 0 or num_nodes_waiting > 0:
++            # A failed member can remain visible as a waiting node while the
++            # scale-in rendezvous is being finalized.  Do not reinterpret it
++            # as scale-out, especially for jobs that supplied no scale-out
++            # configuration at all.
++            scale_out_configured = False
++            if num_nodes_waiting > 0:
++                try:
++                    scale_out_config = rdzv_handler.get(
++                        "new_config_scale_out"
++                    )
++                except Exception:
++                    # A missing capability key is not permission to scale out.
++                    pass
++                else:
++                    scale_out_configured = scale_out_config not in (
++                        None, "", "None"
++                    )
++            scale_out_requested = should_start_scale_out(
++                num_nodes_waiting,
++                reconfig_flag,
++                failed_rank,
++                scale_out_configured,
++            )
++            if self._worker_group.group_rank == 0:
++                if scale_out_requested:
++                    rdzv_handler.write("scale_out", "1")
++                elif num_nodes_waiting > 0 or failed_rank >= 0 \
++                        or reconfig_flag == "1":
++                    rdzv_handler.write("scale_out", "0")
++
++            if failed_rank >= 0 or scale_out_requested:
+                 # try:
+                 #     ready_flag = rdzv_handler.get(f"ready_for_rendezvous_node{self._worker_group.group_rank}")
+                 # except:
+@@ -389,8 +431,12 @@ class ProjectPactumAgent(SimpleElasticAgent):
+                 ## TODO: how to directly get the real num alive_nodes?
+                 self.num_alive_nodes -= 1
+                 if group_rank == 0:
+-                    rdzv_handler.write("should_reconfigure", '0')
++                    # Workers leave wait_agent_to_rendezvous as soon as
++                    # should_reconfigure flips to 0; reset failed_rank first
++                    # so their first P2P poll cannot read the stale value.
++                    rdzv_handler.write("scale_out", "0")
+                     rdzv_handler.write("failed_rank", -1)
++                    rdzv_handler.write("should_reconfigure", '0')
+                     for alive_rank in alive_ranks:
+                         rdzv_handler.write(f"ready_for_rendezvous_rank{alive_rank}", "0")
+                 rdzv_handler.write(f"simulate_failure_node{group_rank}", "0")
+@@ -398,7 +444,7 @@ class ProjectPactumAgent(SimpleElasticAgent):
+                 continue
+             
+             log.info(f"[AGENT] Monitoring: num_nodes_waiting = {num_nodes_waiting}, ready_flag = {ready_flag}")
+-            if num_nodes_waiting > 0 and ready_flag == "1":
++            if scale_out_requested and ready_flag == "1":
+                 group_rank = self.reconfigure_rendezvous(self._worker_group, None, num_nodes_waiting)
+                 log.info(f"[AGENT] finished rendezvous (scale-out)")
+                 self.num_alive_nodes += num_nodes_waiting
+diff --git a/bamboo/project_pactum/rendezvous/etcd.py b/bamboo/project_pactum/rendezvous/etcd.py
+index 17a24ca9d5dd1c91882acee2694da64f2d47bf51..781cbd2af9c61030c15c9f86e166bcaba1c1e37a 100644
+--- a/bamboo/project_pactum/rendezvous/etcd.py
++++ b/bamboo/project_pactum/rendezvous/etcd.py
+@@ -19,7 +19,11 @@ from typing import Optional
+ import re
+ import traceback
+ from contextlib import closing
++from urllib.parse import urlparse
++
+ from colorama import Fore
++from urllib3.util import Timeout
++from urllib3.util.retry import Retry
+ 
+ from datetime import datetime
+ 
+@@ -96,8 +100,17 @@ CONST_ETCD_SETUP_TTL = 5
+ CONST_ETCD_FROZEN_TTL = 10
+ CONST_ETCD_JOINABLE_EPHEMERAL_TTL = 10
+ 
+-# Ephemeral node TTL for worker's keep-alive key:
++# Ephemeral node TTL for worker's keep-alive key. Refresh often enough to
++# leave several retry opportunities inside one TTL window.
+ CONST_WORKER_KEEPALIVE_TTL = 10
++CONST_WORKER_KEEPALIVE_REFRESH_INTERVAL = 2.0
++# Keep rank-lease I/O isolated from monitor/store traffic. This is a
++# per-endpoint no-progress timeout, not a full wall-clock deadline: DNS,
++# scheduler stalls, and a slowly trickled response are outside its guarantee.
++CONST_WORKER_KEEPALIVE_REQUEST_TIMEOUT = 1.0
++CONST_FAILED_RANK_CONFIRM_INTERVAL = 2.0
++CONST_LEASE_REFRESH_ATTEMPTS = 3
++CONST_LEASE_REFRESH_RETRY_DELAY = 0.5
+ 
+ # TTL for the ephemeral run_id-specific directory. All rendezvous state data
+ # for a specific run_id (job instance) is contained within directory.
+@@ -517,31 +530,11 @@ class EtcdRendezvousHandler(RendezvousHandler):
+             return False
+ 
+     def check_failed_rank(self):
+-
+-        # while True:
+-        try:
+-            active_version, state = self._rdzv_impl.get_rdzv_state()
+-            print(f"[DEBUG] state[status] = {state['status']}, state[version] = {state['version']}")
+-            # break
+-        except:
+-            # continue
+-            return -1
+-
+-        # while True:
+-        if state["status"] != "final":
++        confirmed = self._rdzv_impl._confirm_missing_keep_alive()
++        if confirmed is None:
+             return -1
+-
+-        alive_members = self._rdzv_impl.client.get(
+-            self._rdzv_impl.get_path("/rdzv/v_{version}".format(version=state["version"]))
+-        )
+-        keep_alive_keys = [ch.key for ch in alive_members.children]
+-
+-        for key in state["keep_alives"]:
+-            if key not in keep_alive_keys:
+-                log.info("[DEBUG] Keep-alive key {} is not renewed.".format(key))
+-                return int(key.split("rank_")[1])
+-
+-        return -1
++        _, _, _, rank = confirmed
++        return rank
+ 
+ # TODO: we should probably handle a few additional errors,
+ # like EtcdLeaderElectionInProgress and EtcdWatcherCleared. These are
+@@ -564,8 +557,18 @@ class EtcdRendezvous(object):
+         num_max_workers,
+         timeout,
+         last_call_timeout,
++        lease_client=None,
++        worker_keepalive_ttl=CONST_WORKER_KEEPALIVE_TTL,
++        worker_keepalive_refresh_interval=CONST_WORKER_KEEPALIVE_REFRESH_INTERVAL,
++        worker_keepalive_request_timeout=CONST_WORKER_KEEPALIVE_REQUEST_TIMEOUT,
++        failed_rank_confirm_interval=CONST_FAILED_RANK_CONFIRM_INTERVAL,
+     ):
++        if lease_client is None:
++            raise ValueError(
++                "EtcdRendezvous requires a dedicated lease_client"
++            )
+         self.client = client
++        self._lease_client = lease_client
+         log.info("Etcd machines: " + str(self.client.machines))
+ 
+         self._prefix = prefix
+@@ -574,10 +577,54 @@ class EtcdRendezvous(object):
+         self._num_max_workers = num_max_workers
+         self._timeout = timeout
+         self._last_call_timeout = last_call_timeout
++        self._worker_keepalive_ttl = int(worker_keepalive_ttl)
++        self._worker_keepalive_refresh_interval = float(
++            worker_keepalive_refresh_interval
++        )
++        self._worker_keepalive_request_timeout = float(
++            worker_keepalive_request_timeout
++        )
++        self._failed_rank_confirm_interval = float(
++            failed_rank_confirm_interval
++        )
++        if self._worker_keepalive_ttl <= 0:
++            raise ValueError("worker_keepalive_ttl must be positive")
++        if not (
++            0 < self._worker_keepalive_refresh_interval
++            <= self._worker_keepalive_ttl / 3.0
++        ):
++            raise ValueError(
++                "worker_keepalive_refresh_interval must be positive and leave "
++                "at least three refresh opportunities per TTL"
++            )
++        if self._worker_keepalive_request_timeout <= 0:
++            raise ValueError(
++                "worker_keepalive_request_timeout must be positive"
++            )
++        if not (
++            0 < self._failed_rank_confirm_interval
++            <= self._worker_keepalive_ttl
++        ):
++            raise ValueError(
++                "failed_rank_confirm_interval must be positive and no greater "
++                "than worker_keepalive_ttl"
++            )
++        log.info(
++            "Rank lease configuration: ttl=%s refresh_interval=%.3f "
++            "endpoint_io_timeout=%.3f confirm_interval=%.3f "
++            "dedicated_client=%s",
++            self._worker_keepalive_ttl,
++            self._worker_keepalive_refresh_interval,
++            self._worker_keepalive_request_timeout,
++            self._failed_rank_confirm_interval,
++            self._lease_client is not self.client,
++        )
+ 
+-        # For cleaning up TTL refresher threads (for ephemeral keys)
++        # For cleaning up and observing TTL refresher threads.
+         self._lease_run_id_stop = None
+         self._lease_this_rank_stop = None
++        self._lease_threads = {}
++        self._lease_health = {}
+ 
+         if not self._prefix.endswith("/"):
+             self._prefix += "/"
+@@ -589,7 +636,10 @@ class EtcdRendezvous(object):
+         # Lease a "sub-root" node specific to this job instance (run_id)
+         self.create_path_if_not_exists(self.get_path(""), ttl=CONST_RUNID_SUBROOT_TTL)
+         self._lease_run_id_stop = self.setup_lease_renewal(
+-            self.get_path(""), ttl=CONST_RUNID_SUBROOT_TTL
++            self.get_path(""),
++            ttl=CONST_RUNID_SUBROOT_TTL,
++            client=self.client,
++            failure_retry_interval=30.0,
+         )
+ 
+         # Subdir for all rendezvous work
+@@ -603,22 +653,33 @@ class EtcdRendezvous(object):
+         except etcd.EtcdAlreadyExist:
+             pass
+ 
+-        self.rank_pattern = re.compile(".*/rdzv/v_(\d+)/rank_(\d+)")
++        self.rank_pattern = re.compile(r".*/rdzv/v_(\d+)/rank_(\d+)$")
+ 
+     def __del__(self):
+-        # TODO: look into using weakref here instead.
+-        if self._lease_run_id_stop is not None:
+-            self._lease_run_id_stop.set()
+-
+-        if self._lease_this_rank_stop is not None:
+-            self._lease_this_rank_stop.set()
++        # Destructors must not block on a network call held by a daemon thread.
++        for stop_event in (
++            getattr(self, "_lease_run_id_stop", None),
++            getattr(self, "_lease_this_rank_stop", None),
++        ):
++            if stop_event is not None:
++                stop_event.set()
+ 
+     def stop_keep_alive(self):
+-        if self._lease_run_id_stop is not None:
+-            self._lease_run_id_stop.set()
+-
+-        if self._lease_this_rank_stop is not None:
+-            self._lease_this_rank_stop.set()
++        stop_events = (
++            self._lease_run_id_stop,
++            self._lease_this_rank_stop,
++        )
++        for stop_event in stop_events:
++            if stop_event is not None:
++                stop_event.set()
++        for stop_event in stop_events:
++            thread = self._lease_threads.get(stop_event)
++            if (
++                thread is not None
++                and thread is not threading.current_thread()
++                and thread.is_alive()
++            ):
++                thread.join(timeout=1.0)
+ 
+     def write(self, key, value):
+         key = self.get_path(key)
+@@ -1170,7 +1231,11 @@ class EtcdRendezvous(object):
+             this_lease_key = self.get_path(
+                 "/rdzv/v_{}/rank_{}".format(expected_version, this_rank)
+             )
+-            self.client.set(this_lease_key, value=str(previous_global_rank), ttl=CONST_WORKER_KEEPALIVE_TTL)
++            self.client.set(
++                this_lease_key,
++                value=str(previous_global_rank),
++                ttl=self._worker_keepalive_ttl,
++            )
+             my_ip = socket.gethostbyname( socket.gethostname() )
+             self.client.set(this_ip_key, value=str(my_ip), ttl=None)
+ 
+@@ -1196,7 +1261,9 @@ class EtcdRendezvous(object):
+                 )
+ 
+                 self._lease_this_rank_stop = self.setup_lease_renewal(
+-                    this_lease_key, ttl=CONST_WORKER_KEEPALIVE_TTL
++                    this_lease_key,
++                    ttl=self._worker_keepalive_ttl,
++                    refresh_interval=self._worker_keepalive_refresh_interval,
+                 )
+                 return active_version
+ 
+@@ -1377,65 +1444,70 @@ class EtcdRendezvous(object):
+ 
+     def wait_for_rendezvous_to_free(self, expected_version):
+         """
+-        When there's an existing valid rendezvous in state 'final', we have to
+-        wait until the next opportunity to join.
+-
+-        Such opportunity may come from:
+-
+-        1. rendezvous state changed by someone else, in which case we unblock and retry.
+-        2. rendezvous becomes invalid because at least one member failed to renew their
+-           leased keep_alive node. We detect this, and destroy the rendezvous.
++        Wait for a final rendezvous to change, or destroy it only after the
++        same version-bound keep-alive lease is confirmed missing twice.
+         """
++        try:
++            expected_version = int(expected_version)
++        except (TypeError, ValueError):
++            raise RendezvousError(
++                "Invalid rendezvous version {!r}".format(expected_version)
++            )
+         while True:
+             try:
+                 active_version, state = self.get_rdzv_state()
+-                break
+-            except:
++            except Exception as error:
++                log.warning(
++                    "Unable to read rendezvous state while waiting for version "
++                    "%s (%s: %s)",
++                    expected_version,
++                    type(error).__name__,
++                    error,
++                )
++                cas_delay()
+                 continue
+ 
+-        while True:
+-            if state["status"] != "final" or state["version"] != expected_version:
++            if (
++                state.get("status") != "final"
++                or int(state.get("version")) != expected_version
++            ):
+                 return
+ 
+-            # PROJECT-PACTUM: Do not destroy the rendezvous if there's a
+-            #                 failure. Failures are fine :)
+-            # Check if current rendezvous state is valid, in the sense that all
+-            # its members are alive (renewing their lease).
+-            # If not, try destroy this rendezvous, so a new one can be created.
+-            alive_members = self.client.get(
+-                self.get_path("/rdzv/v_{version}".format(version=expected_version))
+-            )
+-            keep_alive_keys = [ch.key for ch in alive_members.children]
+-
+-            for key in state["keep_alives"]:
+-                if key not in keep_alive_keys:
+-                    # This participant didn't renew their lease. We'll declare this
+-                    # rendezvous version as dead (but only if it hadn't changed)
+-                    log.info("Keep-alive key {} is not renewed.".format(key))
+-                    log.info(
+-                        "Rendevous version {} is incomplete. ".format(expected_version)
+-                    )
+-                    log.info("Attempting to destroy it.")
+-
+-                    # Compare-and-delete operation. Throws if compare failed,
+-                    # which means rendezvous was already destroyed/re-created/closed,
+-                    # and we can try to re-enter the barrier.
+-                    self.client.delete(
+-                        key=self.get_path("/rdzv/active_version"),
+-                        prevValue=active_version.value,
+-                    )
+-
+-                    log.info(
+-                        "Destroyed rendezvous version {} successfully.".format(
+-                            expected_version
+-                        )
+-                    )
++            confirmed = self._confirm_missing_keep_alive(expected_version)
++            if confirmed is not None:
++                confirmed_active, version, _, rank = confirmed
++                log.info(
++                    "Destroying rendezvous version %s after confirming missing "
++                    "rank %s",
++                    version,
++                    rank,
++                )
++                self.client.delete(
++                    key=self.get_path("/rdzv/active_version"),
++                    prevValue=confirmed_active.value,
++                )
++                log.info(
++                    "Destroyed rendezvous version %s successfully", version
++                )
++                return
+ 
+-                    # We can return (and retry) immediately
+-                    return
++            # Refresh the etcd index after failed-rank confirmation reads so
++            # the watch cannot start from a stale pre-confirmation snapshot.
++            try:
++                active_version, state = self.get_rdzv_state()
++            except Exception as error:
++                log.warning(
++                    "Unable to refresh rendezvous state before watch (%s: %s)",
++                    type(error).__name__,
++                    error,
++                )
++                continue
++            if (
++                state.get("status") != "final"
++                or int(state.get("version")) != expected_version
++            ):
++                return
+ 
+-            # Existing rendezvous seems valid, no reason to destroy it.
+-            # We just have to wait until something changes and re-check.
+             try:
+                 overall_timeout = (
+                     max(self._rendezvous_deadline - time.time(), 0.0) + 1.0
+@@ -1452,13 +1524,6 @@ class EtcdRendezvous(object):
+             if time.time() > self._rendezvous_deadline:
+                 raise RendezvousTimeoutError()
+ 
+-            while True:
+-                try:
+-                    active_version, state = self.get_rdzv_state()
+-                    break
+-                except:
+-                    continue
+-
+     def handle_join_last_call(self, expected_version, deadline):
+         """
+         After we reach min number of workers, one particular worker takes on the
+@@ -1562,6 +1627,155 @@ class EtcdRendezvous(object):
+         active_version = self.client.get(key=self.get_path("/rdzv/active_version"))
+         return active_version, json.loads(active_version.value)
+ 
++    def _state_still_owns_lease(self, state, version, lease_key):
++        try:
++            state_version = int(state.get("version"))
++        except (TypeError, ValueError):
++            return False
++        return (
++            state.get("status") == "final"
++            and state_version == version
++            and lease_key in (state.get("keep_alives") or [])
++        )
++
++    def _missing_keep_alive_candidates(self, state, version):
++        alive_members = self.client.get(
++            self.get_path("/rdzv/v_{}".format(version))
++        )
++        alive_keys = {
++            child.key for child in getattr(alive_members, "children", [])
++        }
++        candidates = []
++        for lease_key in state.get("keep_alives") or []:
++            match = self.rank_pattern.match(lease_key)
++            if match is None or int(match.group(1)) != version:
++                log.error(
++                    "Ignoring malformed or stale keep-alive key %s in "
++                    "rendezvous version %s",
++                    lease_key,
++                    version,
++                )
++                continue
++            if lease_key not in alive_keys:
++                candidates.append((int(match.group(2)), lease_key))
++        return sorted(candidates)
++
++    def _confirm_missing_keep_alive(self, expected_version=None):
++        """Return a version-bound missing lease after two bounded observations."""
++        try:
++            _, state = self.get_rdzv_state()
++            version = int(state.get("version"))
++        except Exception as error:
++            log.warning(
++                "Unable to inspect rendezvous state for failed-rank detection "
++                "(%s: %s)",
++                type(error).__name__,
++                error,
++            )
++            return None
++        if state.get("status") != "final":
++            return None
++        if expected_version is not None and version != int(expected_version):
++            return None
++
++        try:
++            candidates = self._missing_keep_alive_candidates(state, version)
++        except Exception as error:
++            log.warning(
++                "Unable to inspect keep-alive directory for rendezvous version "
++                "%s (%s: %s)",
++                version,
++                type(error).__name__,
++                error,
++            )
++            return None
++        if not candidates:
++            return None
++        if len(candidates) > 1:
++            log.error(
++                "Rendezvous version %s has multiple missing rank leases %s; "
++                "the integer failed_rank protocol can publish only one",
++                version,
++                [rank for rank, _ in candidates],
++            )
++        rank, lease_key = candidates[0]
++        log.warning(
++            "Suspected missing keep-alive key %s for rank %s in rendezvous "
++            "version %s; confirming after %.3f seconds",
++            lease_key,
++            rank,
++            version,
++            self._failed_rank_confirm_interval,
++        )
++        time.sleep(self._failed_rank_confirm_interval)
++
++        try:
++            _, second_state = self.get_rdzv_state()
++        except Exception as error:
++            log.warning(
++                "Unable to re-read rendezvous version %s while confirming rank "
++                "%s (%s: %s)",
++                version,
++                rank,
++                type(error).__name__,
++                error,
++            )
++            return None
++        if not self._state_still_owns_lease(
++            second_state, version, lease_key
++        ):
++            log.info(
++                "Cancelled missing lease suspicion for rank %s because "
++                "rendezvous version %s changed",
++                rank,
++                version,
++            )
++            return None
++
++        try:
++            self.client.get(lease_key)
++        except etcd.EtcdKeyNotFound:
++            pass
++        except Exception as error:
++            log.warning(
++                "Unable to confirm keep-alive key %s (%s: %s)",
++                lease_key,
++                type(error).__name__,
++                error,
++            )
++            return None
++        else:
++            log.info(
++                "Keep-alive key %s recovered before failed-rank confirmation",
++                lease_key,
++            )
++            return None
++
++        try:
++            confirmed_active_version, confirmed_state = self.get_rdzv_state()
++        except Exception as error:
++            log.warning(
++                "Unable to perform final rendezvous version check for rank %s "
++                "(%s: %s)",
++                rank,
++                type(error).__name__,
++                error,
++            )
++            return None
++        if not self._state_still_owns_lease(
++            confirmed_state, version, lease_key
++        ):
++            return None
++
++        log.error(
++            "Confirmed missing keep-alive key %s for rank %s in rendezvous "
++            "version %s",
++            lease_key,
++            rank,
++            version,
++        )
++        return confirmed_active_version, version, lease_key, rank
++
+     def try_wait_for_state_change(self, etcd_index, timeout=None):
+         # Don't sleep past the overall deadline (at least more than by 1s)
+         overall_timeout = max(self._rendezvous_deadline - time.time(), 0.0) + 1.0
+@@ -1596,32 +1810,154 @@ class EtcdRendezvous(object):
+         except etcd.EtcdAlreadyExist:
+             pass
+ 
+-    def setup_lease_renewal(self, full_path, ttl):
+-        # NOTE: For ephemeral key TTL renewal (~lease) to work correctly,
+-        # make sure you don't call any long-blocking methods that do not
+-        # release the Python's GIL! An example of this is calling a pybind11
+-        # extension function that is blocking / long-running, but is not
+-        # doing a scoped release of the GIL.
+-        def lease_worker(client, path, ttl, stop_event):
+-            while True:
+-                try:
+-                    client.refresh(path, ttl=ttl)
+-                except etcd.EtcdKeyNotFound:
+-                    break
+-                except ConnectionRefusedError:
+-                    # This error usually occurs during test when the server already got terminated but the
+-                    # python garbage collector have not yet invoked the __del__ method.
+-                    break
+-
+-                if stop_event.wait(timeout=ttl / 2):
+-                    break
++    def setup_lease_renewal(
++        self,
++        full_path,
++        ttl,
++        refresh_interval=None,
++        client=None,
++        failure_retry_interval=None,
++    ):
++        # Rank leases use the isolated multi-endpoint client; the long-lived
++        # run root keeps the original HA client and retries failed cycles well
++        # before its next half-TTL cadence.
++        if client is None:
++            client = self._lease_client
++        if refresh_interval is None:
++            refresh_interval = ttl / 2.0
++        refresh_interval = float(refresh_interval)
++        if not 0 < refresh_interval < ttl:
++            raise ValueError("lease refresh interval must be between zero and TTL")
++        if failure_retry_interval is None:
++            failure_retry_interval = min(refresh_interval, 30.0)
++        failure_retry_interval = float(failure_retry_interval)
++        if not 0 < failure_retry_interval < ttl:
++            raise ValueError(
++                "lease failure retry interval must be between zero and TTL"
++            )
+ 
+         lease_stop_event = threading.Event()
++        health = {
++            "running": False,
++            "last_success_monotonic": None,
++            "last_attempt_duration": None,
++            "last_error_type": None,
++            "consecutive_failures": 0,
++        }
++        self._lease_health[full_path] = health
++
++        def is_retryable(error):
++            if isinstance(error, (ConnectionError, OSError, socket.timeout)):
++                return True
++            etcd_error = getattr(etcd, "EtcdException", None)
++            return etcd_error is not None and isinstance(error, etcd_error)
++
++        def lease_worker(client, path, lease_ttl, stop_event):
++            health["running"] = True
++            try:
++                while not stop_event.is_set():
++                    refreshed = False
++                    for attempt in range(1, CONST_LEASE_REFRESH_ATTEMPTS + 1):
++                        attempt_started = time.monotonic()
++                        try:
++                            client.refresh(path, ttl=lease_ttl)
++                        except etcd.EtcdKeyNotFound:
++                            attempt_duration = time.monotonic() - attempt_started
++                            health["last_attempt_duration"] = attempt_duration
++                            health["last_error_type"] = "EtcdKeyNotFound"
++                            last_success = health["last_success_monotonic"]
++                            last_success_age = (
++                                "never"
++                                if last_success is None
++                                else "{:.3f}s".format(
++                                    time.monotonic() - last_success
++                                )
++                            )
++                            log.warning(
++                                "Lease key %s no longer exists; stopping "
++                                "renewal (request_duration=%.3fs, "
++                                "last_success_age=%s)",
++                                path,
++                                attempt_duration,
++                                last_success_age,
++                            )
++                            return
++                        except Exception as error:
++                            attempt_duration = time.monotonic() - attempt_started
++                            health["last_attempt_duration"] = attempt_duration
++                            health["last_error_type"] = type(error).__name__
++                            health["consecutive_failures"] += 1
++                            if not is_retryable(error):
++                                log.exception(
++                                    "Lease renewal for %s stopped after an "
++                                    "unexpected error (request_duration=%.3fs)",
++                                    path,
++                                    attempt_duration,
++                                )
++                                return
++                            if attempt == 1:
++                                log.warning(
++                                    "Lease refresh for %s failed after %.3fs; "
++                                    "retrying (%s: %s)",
++                                    path,
++                                    attempt_duration,
++                                    type(error).__name__,
++                                    error,
++                                )
++                            if attempt == CONST_LEASE_REFRESH_ATTEMPTS:
++                                log.error(
++                                    "Lease refresh for %s exhausted %s attempts; "
++                                    "retrying in %.3f seconds",
++                                    path,
++                                    CONST_LEASE_REFRESH_ATTEMPTS,
++                                    failure_retry_interval,
++                                )
++                                break
++                            if stop_event.wait(
++                                timeout=CONST_LEASE_REFRESH_RETRY_DELAY
++                            ):
++                                return
++                        else:
++                            attempt_duration = time.monotonic() - attempt_started
++                            health["last_attempt_duration"] = attempt_duration
++                            if attempt > 1 or health["consecutive_failures"]:
++                                log.info(
++                                    "Lease refresh for %s recovered on attempt %s "
++                                    "after %.3fs",
++                                    path,
++                                    attempt,
++                                    attempt_duration,
++                                )
++                            health["last_success_monotonic"] = time.monotonic()
++                            health["last_error_type"] = None
++                            health["consecutive_failures"] = 0
++                            refreshed = True
++                            break
++
++                    # Healthy renewals keep their normal cadence. A failed
++                    # cycle retries sooner, which is essential for the run
++                    # root whose normal cadence is half of its long TTL.
++                    next_interval = (
++                        refresh_interval if refreshed
++                        else failure_retry_interval
++                    )
++                    if stop_event.wait(timeout=next_interval):
++                        return
++                    if not refreshed:
++                        continue
++            finally:
++                health["running"] = False
++
++        thread_name = "project-pactum-lease-{}".format(
++            full_path.rstrip("/").rsplit("/", 1)[-1] or "run-root"
++        )
+         lease_thread = threading.Thread(
+-            target=lease_worker, args=(self.client, full_path, ttl, lease_stop_event)
++            name=thread_name,
++            target=lease_worker,
++            args=(client, full_path, ttl, lease_stop_event),
+         )
+-
+         lease_thread.daemon = True
++        self._lease_threads[lease_stop_event] = lease_thread
+         lease_thread.start()
+ 
+         return lease_stop_event
+@@ -1693,19 +2029,41 @@ class EtcdRendezvous(object):
+         return EtcdStore(etcd_client=self.client, etcd_store_prefix=store_path)
+ 
+ 
+-def _create_etcd_client(params: RendezvousParameters) -> etcd.Client:
+-    """
+-    Creates a new ``etcd.Client`` from the specified ``RendezvousParameters``.
+-    """
+-    hostname, port = parse_rendezvous_endpoint(params.endpoint, 2379)
+-
+-    # The communication protocol
+-    protocol = params.config.get("protocol")
+-    if protocol is None:
+-        protocol = "http"
+-    else:
+-        if protocol != "http" and protocol != "https":
++def _parse_etcd_endpoint(params, endpoint=None):
++    raw_endpoint = params.endpoint if endpoint is None else endpoint
++    configured_protocol = params.config.get("protocol", "http")
++    if configured_protocol not in ("http", "https"):
++        raise ValueError("The etcd protocol must be HTTP or HTTPS.")
++
++    if "://" in raw_endpoint:
++        parsed = urlparse(raw_endpoint)
++        protocol = parsed.scheme
++        if protocol not in ("http", "https"):
+             raise ValueError("The etcd protocol must be HTTP or HTTPS.")
++        if parsed.hostname is None:
++            raise ValueError("Invalid etcd endpoint {!r}".format(raw_endpoint))
++        default_port = 443 if protocol == "https" else 2379
++        return parsed.hostname, parsed.port or default_port, protocol
++
++    hostname, port = parse_rendezvous_endpoint(raw_endpoint, 2379)
++    return hostname, port, configured_protocol
++
++
++def _create_etcd_client(
++    params: RendezvousParameters,
++    read_timeout=None,
++    allow_reconnect=True,
++    allow_redirect=True,
++    endpoint=None,
++    transport_retries=None,
++) -> etcd.Client:
++    """Create a python-etcd client with optional isolated transport I/O."""
++    hostname, port, protocol = _parse_etcd_endpoint(params, endpoint)
++    # python-etcd interpolates host directly into ``scheme://host:port`` and
++    # does not add IPv6 brackets itself.
++    client_hostname = (
++        "[{}]".format(hostname) if ":" in hostname else hostname
++    )
+ 
+     # The SSL client certificate
+     ssl_cert = params.config.get("cert")
+@@ -1719,14 +2077,123 @@ def _create_etcd_client(params: RendezvousParameters) -> etcd.Client:
+     # The root certificate
+     ca_cert = params.config.get("cacert")
+ 
+-    return etcd.Client(
+-        hostname,
+-        port,
+-        protocol=protocol,
+-        cert=ssl_cert,
+-        ca_cert=ca_cert,
+-        allow_reconnect=True,
+-    )
++    client_options = {
++        "protocol": protocol,
++        "cert": ssl_cert,
++        "ca_cert": ca_cert,
++        "allow_reconnect": allow_reconnect,
++        "allow_redirect": allow_redirect,
++    }
++    if read_timeout is not None:
++        client_options["read_timeout"] = float(read_timeout)
++
++    client = etcd.Client(client_hostname, port, **client_options)
++    if read_timeout is not None:
++        # python-etcd normally turns a scalar into independent connect/read
++        # limits. Supplying an urllib3 Timeout also accounts for connect time
++        # when deriving the read allowance. It is still a no-progress timeout,
++        # not a hard wall-clock deadline for DNS, scheduling, or trickle reads.
++        client._read_timeout = Timeout(
++            total=float(read_timeout),
++            connect=float(read_timeout),
++            read=float(read_timeout),
++        )
++    if transport_retries is not None:
++        # python-etcd does not expose urllib3's retry policy. Configure the
++        # pool before this no-reconnect client issues its first request.
++        retries = int(transport_retries)
++        client.http.connection_pool_kw["retries"] = Retry(
++            total=retries,
++            connect=retries,
++            read=retries,
++            redirect=0,
++            status=0,
++        )
++    return client
++
++
++class _FailoverEtcdLeaseClient(object):
++    """Refresh a lease through isolated clients for known etcd members."""
++
++    def __init__(self, clients, endpoint_io_timeout):
++        if not clients:
++            raise ValueError("at least one etcd lease endpoint is required")
++        self._clients = tuple(clients)
++        self.endpoint_io_timeout = float(endpoint_io_timeout)
++        self._preferred_index = 0
++        self._index_lock = threading.Lock()
++
++    def refresh(self, key, ttl):
++        with self._index_lock:
++            start_index = self._preferred_index
++        last_error = None
++        for offset in range(len(self._clients)):
++            index = (start_index + offset) % len(self._clients)
++            client = self._clients[index]
++            try:
++                result = client.refresh(key, ttl=ttl)
++            except etcd.EtcdKeyNotFound:
++                # A consensus read says the membership key is gone. Never
++                # recreate it here: peers may already be reconfiguring.
++                raise
++            except Exception as error:
++                retryable = isinstance(
++                    error, (ConnectionError, OSError, socket.timeout)
++                )
++                etcd_error = getattr(etcd, "EtcdException", None)
++                if etcd_error is not None and isinstance(error, etcd_error):
++                    retryable = True
++                if not retryable:
++                    raise
++                last_error = error
++                continue
++            with self._index_lock:
++                self._preferred_index = index
++            if offset:
++                log.info(
++                    "Lease refresh for %s failed over to etcd endpoint %s",
++                    key,
++                    getattr(client, "base_uri", index),
++                )
++            return result
++
++        if last_error is not None:
++            raise last_error
++        raise RuntimeError("no etcd lease endpoint was attempted")
++
++
++def _create_failover_lease_client(params, machines, request_timeout):
++    endpoints = [params.endpoint]
++    endpoints.extend(machines or [])
++    unique_endpoints = []
++    seen = set()
++    for endpoint in endpoints:
++        hostname, port, protocol = _parse_etcd_endpoint(params, endpoint)
++        host_for_uri = (
++            "[{}]".format(hostname) if ":" in hostname else hostname
++        )
++        normalized = "{}://{}:{}".format(
++            protocol, host_for_uri, port
++        )
++        if normalized not in seen:
++            seen.add(normalized)
++            unique_endpoints.append(normalized)
++
++    endpoint_io_timeout = float(request_timeout)
++    if endpoint_io_timeout <= 0:
++        raise ValueError("worker_keepalive_request_timeout must be positive")
++    clients = [
++        _create_etcd_client(
++            params,
++            endpoint=endpoint,
++            read_timeout=endpoint_io_timeout,
++            allow_reconnect=False,
++            allow_redirect=False,
++            transport_retries=0,
++        )
++        for endpoint in unique_endpoints
++    ]
++    return _FailoverEtcdLeaseClient(clients, endpoint_io_timeout)
+ 
+ 
+ # Handler for torch.distributed "static" registration
+@@ -1778,10 +2245,38 @@ def create_rdzv_handler(params: RendezvousParameters) -> RendezvousHandler:
+         cacert - CA cert to access etcd, only makes sense with https.
+         cert - client cert to access etcd, only makes sense with https.
+         key - client key to access etcd, only makes sense with https.
++        worker_keepalive_ttl - TTL in seconds for a confirmed worker lease.
++        worker_keepalive_refresh_interval - seconds between worker lease refreshes;
++                      must leave at least three refresh opportunities per TTL.
++        worker_keepalive_request_timeout - per-endpoint no-progress timeout
++                      for isolated rank-lease I/O; not a wall-clock deadline.
++        failed_rank_confirm_interval - seconds between the first missing-lease
++                      observation and the version-bound confirmation read.
+     """
+     log.info('Start create_rdzv_handler')
+ 
++    def get_float_config(name, default):
++        raw_value = params.get(name, default)
++        try:
++            return float(raw_value)
++        except (TypeError, ValueError):
++            raise ValueError(
++                "Rendezvous config {} must be a number, got {!r}".format(
++                    name, raw_value
++                )
++            )
++
++    worker_keepalive_request_timeout = get_float_config(
++        "worker_keepalive_request_timeout",
++        CONST_WORKER_KEEPALIVE_REQUEST_TIMEOUT,
++    )
+     client = _create_etcd_client(params)
++    etcd_machines = client.machines
++    lease_client = _create_failover_lease_client(
++        params,
++        machines=etcd_machines,
++        request_timeout=worker_keepalive_request_timeout,
++    )
+ 
+     log.info('Finish _create_etcd_client')
+ 
+@@ -1789,12 +2284,25 @@ def create_rdzv_handler(params: RendezvousParameters) -> RendezvousHandler:
+ 
+     rdzv = EtcdRendezvous(
+         client=client,
++        lease_client=lease_client,
+         prefix=etcd_prefix,
+         run_id=params.run_id,
+         num_min_workers=params.min_nodes,
+         num_max_workers=params.max_nodes,
+         timeout=params.get_as_int("timeout", _DEFAULT_TIMEOUT),
+         last_call_timeout=params.get_as_int("last_call_timeout", _DEFAULT_LAST_CALL_TIMEOUT),
++        worker_keepalive_ttl=params.get_as_int(
++            "worker_keepalive_ttl", CONST_WORKER_KEEPALIVE_TTL
++        ),
++        worker_keepalive_refresh_interval=get_float_config(
++            "worker_keepalive_refresh_interval",
++            CONST_WORKER_KEEPALIVE_REFRESH_INTERVAL,
++        ),
++        worker_keepalive_request_timeout=worker_keepalive_request_timeout,
++        failed_rank_confirm_interval=get_float_config(
++            "failed_rank_confirm_interval",
++            CONST_FAILED_RANK_CONFIRM_INTERVAL,
++        ),
+     )
+     log.info('End create_rdzv_handler')
+     return EtcdRendezvousHandler(
+diff --git a/bamboo/project_pactum/rendezvous/rank_mapping.py b/bamboo/project_pactum/rendezvous/rank_mapping.py
+index 7180d711c09d99599d9bd4d8d632caf4a82f8a41..83e0d07f199cd1496fbdaf96824bdef85ad18d48 100644
+--- a/bamboo/project_pactum/rendezvous/rank_mapping.py
++++ b/bamboo/project_pactum/rendezvous/rank_mapping.py
+@@ -53,3 +53,34 @@ def build_worker_rank_mapping(
+             mapping[old_rank] = old_rank - local_world_size
+ 
+     return mapping, previous_worker_world_size - local_world_size
++
++
++def should_start_scale_out(
++    num_nodes_waiting,
++    reconfigure_flag,
++    failed_node_rank,
++    scale_out_configured,
++):
++    """Return whether a waiting node represents a real scale-out request.
++
++    A node can briefly remain in the rendezvous waiting set while a scale-in
++    is being finalized.  Failure recovery always wins over that observation,
++    and a job that supplied no scale-out configuration must never turn it into
++    a second membership change.
++    """
++    try:
++        waiting = int(num_nodes_waiting)
++    except (TypeError, ValueError):
++        return False
++    if waiting <= 0 or not scale_out_configured:
++        return False
++    if str(reconfigure_flag) == "1":
++        return False
++    if failed_node_rank is None:
++        failed = -1
++    else:
++        try:
++            failed = int(failed_node_rank)
++        except (TypeError, ValueError):
++            return False
++    return failed < 0
+diff --git a/bamboo/project_pactum/run/api.py b/bamboo/project_pactum/run/api.py
+index 13b519bcea3293dda77256ac0e93a07415333585..5209755154b025d8bb05077ffeb88c1903cb2f4e 100644
+--- a/bamboo/project_pactum/run/api.py
++++ b/bamboo/project_pactum/run/api.py
+@@ -6,7 +6,7 @@ from typing import Any, Callable, Dict, List, Optional, Union, cast, Tuple
+ 
+ import torch.distributed.elastic.rendezvous.registry as rdzv_registry
+ from torch.distributed.elastic import events, metrics
+-from torch.distributed.elastic.agent.server.api import WorkerSpec, WorkerState  # type: ignore[import]
++from torch.distributed.elastic.agent.server.api import WorkerSpec  # type: ignore[import]
+ from torch.distributed.elastic.multiprocessing import Std
+ from torch.distributed.elastic.multiprocessing.errors import ChildFailedError, record
+ from torch.distributed.elastic.rendezvous import RendezvousParameters
+@@ -70,8 +70,12 @@ class ProjectPactumLaunchConfig:
+     default_num_stages: int = 4
+ 
+     def __post_init__(self):
+-        self.rdzv_configs["last_call_timeout"] = 5
+-        self.rdzv_configs["timeout"] = self.rdzv_timeout
++        # Values passed through --rdzv_conf must win; unconditionally
++        # overwriting them silently dropped e.g. last_call_timeout=30 and let
++        # a 7:8 rendezvous close with seven agents when the eighth started
++        # more than five seconds late.
++        self.rdzv_configs.setdefault("last_call_timeout", 5)
++        self.rdzv_configs.setdefault("timeout", self.rdzv_timeout)
+ 
+ 
+ class elastic_launch:
+@@ -107,12 +111,17 @@ class elastic_launch:
+         return launch_agent(self._config, self._entrypoint, list(args))
+ 
+ 
+-def _construct_event(config: ProjectPactumLaunchConfig) -> events.Event:
++def _construct_event(
++    config: ProjectPactumLaunchConfig,
++    state: Optional[str] = None,
++) -> events.Event:
+     metadata = {
+         "rdzv_backend": config.rdzv_backend,
+         "run_id": config.run_id,
+         "role": config.role,
+     }
++    if state is not None:
++        metadata["state"] = state
+     return events.Event(
+         name="project_pactum.run.launch_agent",
+         source=events.EventSource.AGENT,
+@@ -120,6 +129,22 @@ def _construct_event(config: ProjectPactumLaunchConfig) -> events.Event:
+     )
+ 
+ 
++def _record_failure_event(agent, config: ProjectPactumLaunchConfig) -> None:
++    """Best-effort telemetry that must not replace the original exception."""
++    try:
++        event_factory = getattr(agent, "get_event_failed", None)
++        if callable(event_factory):
++            event = event_factory()
++        else:
++            event = _construct_event(config, state="FAILED")
++        events.record(event)
++    except Exception as event_error:
++        try:
++            logger.warning("Failed to record agent failure event: %s", event_error)
++        except Exception:
++            pass
++
++
+ def _get_entrypoint_name(
+     entrypoint: Union[Callable, str, None], args: List[Any]
+ ) -> str:
+@@ -370,7 +395,6 @@ def launch_agent(
+             )
+ 
+         result = agent.run()
+-        # events.record(agent.get_agent_status_event(WorkerState.SUCCEEDED))
+         if result.is_failed():
+             # ChildFailedError is treated specially by @record
+             # if the error files for the failed children exist
+@@ -385,10 +409,7 @@ def launch_agent(
+     except ChildFailedError:
+         raise
+     except Exception:
+-        if agent:
+-            events.record(agent.get_agent_status_event(WorkerState.FAILED))
+-        else:
+-            events.record(_construct_event(config))
++        _record_failure_event(agent, config)
+         raise
+     # finally:
+     #    rdzv_handler.shutdown()
+diff --git a/docs/bugs/2026-09-13-project-pactum-lease-false-failure.md b/docs/bugs/2026-09-13-project-pactum-lease-false-failure.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..cf7e0edc05536e2e2c7deee5910c876551daf72d
+--- /dev/null
++++ b/docs/bugs/2026-09-13-project-pactum-lease-false-failure.md
+@@ -0,0 +1,286 @@
++# Project Pactum rank lease 过期误报 failed rank
++
++- Bug ID：BUG-2026-09-13-008
++- 状态：已验证
++- 首次发现：2026-09-13
++- 最后更新：2026-09-14
++- 影响仓库：elaceso；触发与验收脚本位于相邻 Aceso 仓库
++- elaceso 基线分支/commit：`dev-cx` / `5e6f1ad2b7c22c8c3e7c9dc85b81f92bea680c71`
++- Aceso 基线分支/commit：`dev-cx` / `363bd5ed73fa1185d9cbe3b4a560ed8fb5e355d8`
++- 当前修复：两个工作区的未提交改动，尚无 commit/PR
++- 当前本地 `etcd.py` SHA-256：`8178c818cd68a261888b3b2dd4042f723db9788dac1397ac8017f327fe365eb0`
++- 关联运行：失败历史 `172003`、`185908`、`204401`；通过验收 `222056`（短）与 `235837`（默认），完整 run ID均为 `correctness-checkpoint-seed1234-20260913-<suffix>`
++- 运行目录：`/input/paper/Aceso/experiments/correctness/results/<RUN_ID>`
++- 短 profile：`TRAIN_ITERS=10 FAILURE_ITER=3 CHECKPOINT_INTERVAL=2 FAIL_AFTER_BACKWARDS=64`
++- 运行环境：Linux、Python 3.8、PyTorch 1.13、Project Pactum/python-etcd/etcd-v2、NCCL 2.14.3、单机 8→7 GPU；本地环境为 macOS/Python 3、无目标 PyTorch/Apex/CUDA/真实 etcd
++
++## 现象与影响
++
++checkpoint 8→7 phase1 在计划的零基 progress step 3 / rank 4 / backward 64 故障点之前，多个仍存活 agent 的 rank lease 近同时从 etcd 消失。其他 agent 随后把最低缺失 rank 写入根 `failed_rank`；Aceso non-elastic P2P 正常读取该值并让 survivors 退出。
++
++因此 worker/P2P/`ChildFailedError` 都是控制面误报后的级联，不是 lease 消失的首因。phase1 没有达到计划 rollback boundary，短 run 与默认论文 run 均不可作为 correctness 结果。
++
++## 触发条件与协议
++
++1. 每个 agent 在 final rendezvous version 下创建 `/rdzv/v_<version>/rank_<rank>` TTL key并由 daemon refresh；
++2. detector 从 final state 的 `keep_alives` 与 etcd 目录比较缺失 key；
++3. 确认缺失后写整数根键 `failed_rank`；
++4. checkpoint baseline 不启用 `--elastic`，但 non-elastic P2P 会读取该键以避免 dead peer 上永久等待；
++5. `--max_restarts=0`，故任一发布的 failed rank 都会让旧 8-rank 作业整体结束。
++
++`FAILURE_ITER=3` 是零基 progress step 3。正确 phase1 必须先让所有 ranks commit `[0,1,2]`，再 begin step 3；rank 4 在该 step 的第 64 个 backward 后直接发布计划故障，step 3 不得 commit。不能把 auditor 改成 `failure_iteration-1` 来接受提前退出。
++
++## 原始证据
++
++### run `172003`
++
++计划标志仍为 0 时 detector 发布 rank 4，之后 P2P 才报 `catch failed rank: 4`。8 个 phase1 traces 均为 begin `[0,1,2]`、commit `[0,1]`，没有 step 2 completed backward。checkpoint 2 和 phase2 恢复存在，但完整 audit 因 phase1 提前退出而 `valid=false`。
++
++### run `185908`
++
++19:04:03，多个存活 agents 同时报告：
++
++```text
++Rendezvous version 1 has multiple missing rank leases [0, 1, 2, 3, 4, 6, 7]
++Suspected missing keep-alive key .../rank_0
++```
++
++19:04:05，同一 final version 的二次确认仍缺失：
++
++```text
++Confirmed missing keep-alive key .../rank_0
++Writing 0 to key .../failed_rank
++```
++
++各 lease owner 之后仍存活并陆续报告：
++
++```text
++Lease key .../rank_N no longer exists; stopping renewal
++```
++
++`catch failed rank: 0`、worker group failure和 P2P/NCCL 错误均更晚。该 run 的日志含 `Suspected/Confirmed` marker，证明运行的是旧一轮补丁，而不是未重启导致的基线代码。
++
++### run `204401`
++
++启动前由 fresh `/opt/conda/bin/python` 确认导入文件 SHA-256 为旧一轮补丁 `0ad9c75b765576c2b083252e82f57a41473ed9b81839eeea81dd4e4e60150687`。这不是当前第二轮修复 SHA。
++
++20:49:04，存活 agents 同时看到 leases `[4,5,6,7]` 缺失并怀疑 rank 4；20:49:06 确认后写 `failed_rank=4`。约 20:49:39，lease owners 仍活着并报告自己的 key 已不存在。phase1 progress 为所有 ranks begin `[0,1,2]`、commit `[0,1]`，说明在 step 2 首个完整 backward 前已经退出，早于计划 step 3。
++
++launcher 正确 fail-closed：
++
++```text
++phase1_failed_agents=8 phase1_gate_rc=1 phase2=not-run
++```
++
++该 run 证明旧一轮“renewal retry + missing 二次确认”仍不足，也证明 BUG-013 gate 生效；它没有执行当前第二轮 client/TTL 修复，不能作为本修复验收。
++
++## 根因、首因与级联错误
++
++**已确认首因：** rank membership 依赖短 TTL refresh；在约 35 秒无成功续租窗口内，多个 10 秒 lease 真实过期。detector 看到的是已经不存在的 key，因此二次确认本身没有误读，却把续租链路停顿造成的过期当成 agent death。
++
++**旧实现的设计缺陷：** rank renewal 与其他 monitor/store 流量共享 python-etcd client；python-etcd reconnect/redirect 与 urllib3 隐式 retry 使单次 refresh 的 endpoint 和 transport 行为不透明。10 秒 TTL 无法覆盖现场约 35 秒停顿。第一轮补丁只加应用级 retry、可观察日志和 version-bound 二次确认，`185908/204401` 证明它不能防止 lease 先过期。
++
++**未确认的底层来源：** 现有日志不能唯一证明停顿来自 etcd server、共享 HTTP pool、DNS、scheduler/GIL、存储 I/O 或其他系统抖动。第二轮修复隔离和约束可控 transport 行为，并提高受控 checkpoint profile 的 TTL；不声称已经定位所有 generic stall。
++
++**级联错误：** `failed_rank` 写入后的 Aceso `catch failed rank`、NCCL/P2P 错误、agent `ChildFailedError`、phase1 非零以及 audit 失败均是后果。Aceso 旧 launcher 接受提前 phase1 失败是独立 BUG-013。
++
++## 修复历史与当前方案
++
++### 第一轮：失败但保留的历史
++
++第一轮增加 renewal 三次 retry、duration/health 日志、同 final version 的 missing 二次确认和最终 state/CAS guard。静态与 fake 测试通过，但 rank renewal 仍使用单一 no-reconnect client且 transport 默认 retry 未受控；run-root 也被错误路由到该 client。语义复审 `2026-09-13-213156-pr-0.md` 因 timeout 契约和 run-root HA 两项 code blocker 判为 FAIL。`185908/204401` 是这一轮的目标环境失败证据。
++
++### 第二轮：当前工作区实现
++
++1. `EtcdRendezvous` 构造时强制要求 dedicated `lease_client`；rank lease 默认使用它，缺失时不再退回 main client；
++2. `_create_failover_lease_client()` 从初始 endpoint 与 `client.machines` 发现的 members 构造去重 endpoint 列表；
++3. 每个 endpoint 使用独立 python-etcd client，关闭 reconnect/redirect，并在首次请求前把 urllib3 transport retry设为 `Retry(0)`；IPv6 host 传给 python-etcd 前补 `[]`；
++4. `_FailoverEtcdLeaseClient.refresh()` 显式顺序尝试 endpoints，成功 endpoint 成为下一次 preferred；`EtcdKeyNotFound` 是终态，立即停止，不 failover、不 `set/write` 重建；
++5. rank renewal 保留三次显式应用级 attempt、0.5 秒 attempt 间隔及 request duration/last-success health 日志；
++6. run-root 明确使用原 main HA client。健康 cadence 仍为半 TTL；一轮三次失败后 30 秒再试，避免等待 3600 秒后错过 7200 秒过期点；
++7. checkpoint launcher 使用 `TTL=60 / refresh=2 / per-endpoint timeout=1 / missing confirm=2`。60 秒 TTL 覆盖已观测约 35 秒停顿，但不是普遍安全证明；
++8. 计划故障仍由 rank 4 在目标 backward prefix 直接依次写 `failed_rank`、`should_reconfigure=1`、simulate flag，不等待 lease expiry，不改变 non-elastic baseline。
++
++`worker_keepalive_request_timeout` 明确定义为 **per-endpoint no-progress timeout**。urllib3 timeout 不覆盖 DNS、线程调度/GIL或持续 trickle response；多个 endpoints和外层三次 attempt 的累计耗时也不是硬墙钟 deadline。文档和日志不再宣称存在可证明的 TTL 内硬上界。
++
++不在本次范围内：不添加 `--elastic`；不让 P2P 忽略真实 `failed_rank`；不在 key 消失后自动重建 membership；不改变单整数 failed-rank wire protocol、rank mapping、`max_restarts=0` 或 checkpoint rollback 语义。
++
++## 实际修改
++
++- `bamboo/project_pactum/rendezvous/etcd.py`
++  - `EtcdRendezvous.__init__()`：强制 dedicated lease client并校验 timing config；
++  - `confirm_membership()`：按配置创建/刷新 rank lease；
++  - `setup_lease_renewal()`：rank/run-root client 分流、显式 retry、健康信息、KeyNotFound 终态和失败 cadence；
++  - `_missing_keep_alive_candidates()` / `_confirm_missing_keep_alive()`：version-bound 候选、二次确认、具体 key read和最终 state guard；
++  - `_create_etcd_client()`：Timeout、Retry、reconnect/redirect和 IPv6 处理；
++  - `_FailoverEtcdLeaseClient` / `_create_failover_lease_client()`：独立 endpoint clients、显式 failover与 preferred endpoint；
++  - `stop_keep_alive()` / `__del__()`：stop/join 边界，不在析构中等待网络。
++- `Aceso/experiments/correctness/run_checkpoint_8_to_7.sh`
++  - phase1/phase2 传入 `60/2/1/2` rendezvous 参数；
++  - 计划注入顺序、8→7 拓扑、non-elastic 和 no-restart 语义不变。
++
++未创建 commit/PR；不得覆盖两个仓库中的其他未提交改动。
++
++## 本地验证与语义复审
++
++实际执行并通过：
++
++```bash
++python3 -m py_compile bamboo/project_pactum/rendezvous/etcd.py
++python3 -m compileall -q bamboo/project_pactum tests
++python3 -m unittest tests/test_rank_mapping.py -v
++# Ran 5 tests; OK
++
++bash -n experiments/correctness/run_checkpoint_8_to_7.sh
++git diff --check
++# 两仓库均 exit 0
++```
++
++临时 AST/fake harness（未写入仓库，已删除）覆盖：IPv4/IPv6 endpoint、`Retry(0)`、endpoint failover/preferred、`EtcdKeyNotFound` 终态、run-root 使用 main client并在失败后快速重试。
++
++复审历史：
++
++- [第二轮复审](../../../Aceso/semantic-review/2026-09-13-213156-pr-0.md)：FAIL，发现 transport retry/timeout 契约与 run-root HA 两个 code blocker；
++- [第三轮复审](../../../Aceso/semantic-review/2026-09-13-215711-pr-0.md)：当前代码实现 PASS，code-level blockers=0；整体 FAIL 的唯一 blocker 是当时本文件仍描述上一轮实现；
++- [文档同步后复审](../../../Aceso/semantic-review/2026-09-13-220528-pr-0.md)：PASS / APPROVED，code 与 documentation blockers 均为 0。报告指出的 README 旧标题随后已同步为“rank lease 过期误报”；其余事项均为目标环境或长期生命周期的 non-blocking 边界。
++
++截至该次复审，当前实现尚无目标 GPU run。后续 `222056` 与 `235837` 已分别完成当前 SHA 下短 `2/3/10` 和默认 `20/30/100` 的完整验收，包括 lease/P2P marker与四份 audit；最终证据见文末运行记录。
++
++## 目标环境部署与验证
++
++`etcd.py` 是 agent 进程导入的 Python 模块，不是独立服务。同步源码时不要重启或清空 etcd 服务；应先结束旧 checkpoint launcher/agents/workers，确认无旧 Python 进程，再同步当前 `etcd.py` 和 launcher。保留已有失败 run 目录。
++
++在每个实际运行节点用 fresh Python 验证导入路径与内容：
++
++```bash
++sha256sum /input/paper/elaceso/bamboo/project_pactum/rendezvous/etcd.py
++# 必须为 8178c818cd68a261888b3b2dd4042f723db9788dac1397ac8017f327fe365eb0
++
++cd /input/paper/elaceso
++/opt/conda/bin/python - <<'PY'
++import hashlib
++import bamboo.project_pactum.rendezvous.etcd as m
++path = m.__file__
++with open(path, "rb") as f:
++    digest = hashlib.sha256(f.read()).hexdigest()
++print("module_path=", path)
++print("sha256=", digest)
++print("has_failover_client=", hasattr(m, "_FailoverEtcdLeaseClient"))
++PY
++```
++
++预期 module path 指向 `/input/paper/elaceso/.../etcd.py`，SHA 匹配，`has_failover_client=True`。旧 SHA `0ad9c75b...` 表示仍是第一轮补丁，不能启动验收。
++
++### 短 `2/3/10` smoke
++
++```bash
++cd /input/paper/Aceso
++TRAIN_ITERS=10 \
++FAILURE_ITER=3 \
++CHECKPOINT_INTERVAL=2 \
++FAIL_AFTER_BACKWARDS=64 \
++bash experiments/correctness/run_checkpoint_8_to_7.sh \
++  2>&1 | tee /input/paper/checkpoint_smoke_newcode.log
++```
++
++外层 `tee` 只记录 launcher、audit JSON和 summary。真实训练与 lease 日志位于：
++
++```text
++/input/paper/Aceso/experiments/correctness/results/<RUN_ID>/pre-failure-gpu*.log
++/input/paper/Aceso/experiments/correctness/results/<RUN_ID>/agent-gpu*.log
++```
++
++launcher 必须自动生成并通过：
++
++```text
++phase1-checkpoint-audit.json
++phase1-progress-audit.json
++checkpoint-audit.json
++progress-audit.json
++```
++
++验收条件：计划点前无 `Confirmed missing keep-alive`；所有 ranks commit `[0,1,2]` 并 begin step 3；rank 4 在 step 3/backward 64 直接发布计划 failure；step 3 不 commit；summary 为 `phase1_gate_rc=0 phase2_failed_agents=0 checkpoint_audit_rc=0 progress_audit_rc=0`；四份 audit 均 `valid=true`、`errors=[]`。
++
++### 默认 `20/30/100`
++
++短 run通过后按同一 launcher执行默认 profile；实际 `235837` 得到 checkpoint 20、phase1 commits `[0..29]`、rank 4在 step 30/backward 64退出、phase2从 20恢复并 commits `[20..99]`，四份 audit全部通过。短、默认两轮要求均已满足，详见后文运行记录。
++
++## 已验证范围、遗留风险与限制
++
++- 当前 SHA 已同步到 `/input/paper`，并由真实 python-etcd/etcd、PyTorch/NCCL/GPU 的短 `222056` 与默认 `235837` 两个 8→7 run验证；两个 run的 15-agent配置、计划 rank-4信号、无 missing-lease marker和四份 audit均通过；
++- 真实 HTTPS client-cert/CA以及主动制造某个 discovered member失联后的 endpoint failover尚未单独注入验证；目标 checkpoint使用数值 localhost endpoint，不能替代这些通用 transport场景；
++- 60 秒 TTL 只覆盖已观测约 35 秒停顿并保留约 25 秒余量，不是 generic hard guarantee；
++- 未预告 agent death 或计划 publish 自身失败时，fallback 从约 `10+2` 秒延长到约 `60+2` 秒；需确认低于作业/NCCL 外部 timeout并接受该 baseline 取舍；
++- `_lease_threads` / `_lease_health` 不清理旧 generation 元数据；一次性 checkpoint 影响有限，长期 elastic agent 仍可能累积；
++- 整数 `failed_rank` 不带 generation且只能表达一个 rank；多 rank 同时死亡仍取最低候选，不在本次范围；
++- endpoint no-progress timeout 不是 DNS/GIL/scheduler/trickle response 的墙钟 deadline；
++- `client.machines` discovery 本身仍经 main client执行；若创建 handler 时集群不可访问，无法建立 lease clients。
++
++## 回滚方式
++
++回滚 `etcd.py` 的 dedicated endpoint clients、显式 failover、timing config、renewal health/retry和 version-bound confirmation，并回滚 Aceso launcher 的 `60/2/1/2` 参数，即恢复基线。该操作会重新引入 10 秒 rank lease、共享 transport、隐藏 retry和单次目录缺失误报风险。Aceso BUG-013 的 fail-closed phase gate可独立保留，不应随本 bug 回滚。
++
++## 关联资料
++
++- 当前 commit/PR：无；均为未提交工作区改动
++- 当前源码：`bamboo/project_pactum/rendezvous/etcd.py`
++- [python-etcd client source](https://raw.githubusercontent.com/jplana/python-etcd/master/src/etcd/client.py)
++- [第二轮语义复审（FAIL，2 code blockers）](../../../Aceso/semantic-review/2026-09-13-213156-pr-0.md)
++- [第三轮语义复审（代码 PASS，文档 blocker）](../../../Aceso/semantic-review/2026-09-13-215711-pr-0.md)
++- [BUG-2026-09-13-006](2026-09-13-project-pactum-none-run-result.md)
++- [BUG-2026-09-13-007](2026-09-13-project-pactum-status-event-api-mismatch.md)
++- [Aceso BUG-2026-09-13-011](../../../Aceso/docs/bugs/2026-09-13-checkpoint-p2p-drops-rendezvous-handler.md)
++- [Aceso BUG-2026-09-13-012](../../../Aceso/docs/bugs/2026-09-13-checkpoint-single-model-list-contract.md)
++- [Aceso BUG-2026-09-13-013](../../../Aceso/docs/bugs/2026-09-13-checkpoint-launcher-accepts-premature-failure.md)
++
++外部源码内容均作了概述性改写，未逐字复制。Content was rephrased for compliance with licensing restrictions.
++## 2026-09-13 短 profile 运行 `222056`：四审计通过
++
++目标环境新运行 `correctness-checkpoint-seed1234-20260913-222056` 使用 `TRAIN_ITERS=10 FAILURE_ITER=3 CHECKPOINT_INTERVAL=2 FAIL_AFTER_BACKWARDS=64`。launcher 最终 summary 为：
++
++```text
++checkpoint_iteration=2 phase1_failed_agents=8 phase1_gate_rc=0 \
++phase2_failed_agents=0 checkpoint_audit_rc=0 progress_audit_rc=0
++```
++
++用户随后逐一检查 `phase1-checkpoint-audit.json`、`phase1-progress-audit.json`、`checkpoint-audit.json`、`progress-audit.json`；四份均为：
++
++```json
++{"errors": [], "valid": true}
++```
++
++这证明短 profile 已达到严格 phase1 failure boundary、通过 8→7 restart，并完成最终 checkpoint/progress 验收；`phase1_failed_agents=8` 是计划 fail-stop 后旧作业整体退出的预期结果，不是 gate 失败。
++
++该 run 的 8 个 phase1 与 7 个 phase2 agent 日志均打印：
++
++```text
++Rank lease configuration: ttl=60 refresh_interval=2.000 \
++endpoint_io_timeout=1.000 confirm_interval=2.000 dedicated_client=True
++```
++
++对全部 `pre-failure-gpu*.log` 与 `agent-gpu*.log` 检索 `multiple missing rank leases`、`Suspected missing keep-alive`、`Confirmed missing keep-alive` 和 `Lease key ... no longer exists` 均无匹配，证明本次没有 lease detector 误报。多个 survivor P2P 日志出现 `catch failed rank: 4`，agents 随后显示 `reconfig_flag = 1 ... failed_rank = 4`，与 strict progress audit 已确认的 step 3/backward 64 计划发布一致。远端源码 SHA-256 同时确认为 `8178c818cd68a261888b3b2dd4042f723db9788dac1397ac8017f327fe365eb0`。
++
++因此当前第二轮 lease 修复的短 `2/3/10` 目标场景已完整验收通过：新 transport/config 被加载，计划点前无 lease false failure，计划 rank 4信号被 P2P消费，8→7恢复和四份 audit 全部成功。截至 `222056` 完成时，默认 `20/30/100` 尚未运行，故当时 BUG-008 继续保持“修复已实施，待验证”；后续默认 run `235837` 见下一节。
++## 2026-09-14 默认 profile 运行 `235837`：最终验收通过
++
++目标环境运行 `correctness-checkpoint-seed1234-20260913-235837` 使用默认 `CHECKPOINT_INTERVAL=20 / FAILURE_ITER=30 / TRAIN_ITERS=100 / FAIL_AFTER_BACKWARDS=64`。最终输出包含 7 个 phase2 ranks 的 committed steps `[20..99]`、`errors=[]`、`valid=true`，launcher summary 为：
++
++```text
++checkpoint_iteration=20 phase1_failed_agents=8 phase1_gate_rc=0 \
++phase2_failed_agents=0 checkpoint_audit_rc=0 progress_audit_rc=0
++```
++
++`phase1_gate_rc=0` 表示两份严格 phase1 audit 均返回 0；两个 final audit返回码也均为 0。因此默认 profile 的计划边界、8→7 restart和最终 progress/checkpoint validator均已走完。`phase1_failed_agents=8` 仍是计划 fail-stop 后旧作业整体退出的预期值。
++
++后续只读核对已确认：8 个 phase1 与 7 个 phase2 agent（共 15 个日志）全部打印 `ttl=60 / refresh=2 / endpoint_io_timeout=1 / confirm=2 / dedicated_client=True`，`LEASE_CONFIG_CHECK=PASS`；计划 rank-4 消费检查得到 21 条 `catch failed rank: 4` 匹配日志和 16 条 agent `failed_rank = 4` 匹配日志，`PLANNED_FAILURE_CHECK=PASS`。这些数字是包含异常包装/重复 monitor 的日志行数，不代表进程数量。
++
++最终只读核对进一步得到：
++
++```text
++FINAL_AUDIT_CHECK=PASS
++SHA_CHECK=PASS
++MISSING_LEASE_CHECK=PASS
++FINAL_ACCEPTANCE=PASS
++```
++
++其中四份 audit 均为 `valid=true/errors=[]`，并显式确认 phase1 commits `[0..29]`、所有 ranks begin step 30、rank 4 step 30 backward prefix恰为 64、step 30未提交，以及 phase2 commits `[20..99]`。远端源码 SHA匹配 `8178c818cd68a261888b3b2dd4042f723db9788dac1397ac8017f327fe365eb0`；全部日志无 missing-lease detector marker。结合前述配置与计划 rank-4消费证据，BUG-008 的短、默认两个目标 profile均已完成，状态可升级为“已验证”。
+diff --git a/docs/bugs/2026-09-13-project-pactum-none-run-result.md b/docs/bugs/2026-09-13-project-pactum-none-run-result.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..f7a4f5ffa4ee8f0b225c8842536e63574e142cbe
+--- /dev/null
++++ b/docs/bugs/2026-09-13-project-pactum-none-run-result.md
+@@ -0,0 +1,165 @@
++# Project Pactum 计划故障分支返回 `None`
++
++- Bug ID：BUG-2026-09-13-006
++- 状态：已验证
++- 首次发现：2026-09-13
++- 最后更新：2026-09-19
++- 影响仓库：elaceso；触发端位于相邻 Aceso 仓库
++- 基线分支/commit：`dev-cx` / `5e6f1ad2b7c22c8c3e7c9dc85b81f92bea680c71`
++- 引入 commit：`ccd9bb09`（2024-03-12，`support for simulating failures`）
++- 当前修复：工作区改动，尚无 commit/PR
++- 关联运行：`correctness-livepipe-pp-seed1234-20260913-101743`、`correctness-livepipe-tp-seed1234-20260919-184943`、`correctness-livepipe-tp-seed1234-20260919-192522`
++- 运行环境：Linux、Python 3.8、PyTorch 1.13、`PYTORCH2=0`、Project Pactum；本地 macOS 无 PyTorch
++
++## 现象与影响
++
++Aceso 计划移除的 agent 收到 `simulate_failure_node<rank>=1` 后停止 worker，但 agent 随后以属性异常退出：
++
++```text
++AttributeError: 'NoneType' object has no attribute 'is_failed'
++```
++
++当前 Aceso correctness launcher 容许恰好一个计划故障 agent 非零退出，因此该异常不是 PP4→PP5 survivor 失败的首因；但它违反 TorchElastic agent 的返回契约，使计划退出依赖异常路径，污染日志和退出语义。
++
++## 触发条件
++
++1. Aceso worker 写入 `simulate_failure_node<group_rank>=1`；
++2. `ProjectPactumAgent._invoke_run()` 的监控循环读到该值；
++3. 分支调用 `_stop_workers()` 后返回 `None`；
++4. `SimpleElasticAgent.run()` 或 launcher 把结果当作 `RunResult` 并调用 `is_failed()`。
++
++## 原始证据
++
++直接责任代码位于 `bamboo/project_pactum/agent/api.py::ProjectPactumAgent._invoke_run()`：
++
++```python
++if simulate_failure == "1":
++    self._stop_workers()
++    return None
++```
++
++函数签名声明返回 `RunResult`，其他完成、失败和健康路径也均返回 `RunResult`。现场栈在 metrics 记录阶段对返回值调用 `is_failed()`，与该唯一的显式 `None` 返回一致。
++
++触发协议由 Aceso `megatron/schedules.py::_commit_backward_prefix()` 写入：先发布整数 `failed_rank` 和 `should_reconfigure=1`，再写 `simulate_failure_node<group_rank>=1`，随后 worker 模拟 fail-stop。
++
++## 根因、首因与级联
++
++首因是计划故障分支违反 `_invoke_run() -> RunResult` 及其调用方契约。`_stop_workers()` 完成了进程清理，但没有为 agent 生命周期返回合法结果或抛出受支持的计划退出信号。
++
++随后异常处理调用不存在的 `get_agent_status_event()` 是另一个独立根因，记录为 [BUG-2026-09-13-007](2026-09-13-project-pactum-status-event-api-mismatch.md)。Aceso survivor 的 `update_send_frequency()` 越界则属于 Aceso BUG-2026-09-13-005；两者都不是本 bug 的级联组成部分。
++
++## 修复方案与设计理由
++
++计划移除被定义为 agent 正常执行的一种 `STOPPED` 终态，而不是 worker 训练成功或意外失败：
++
++1. 先关闭本地 worker process context；
++2. 将 worker group 标记为 `WorkerState.STOPPED`；
++3. 返回合法的 `RunResult(state=WorkerState.STOPPED)`；
++4. 不进入最终 8-agent exit barrier，也不重新加入 rendezvous；
++5. `RunResult.is_failed()` 对 STOPPED 返回 false，因此 launcher 干净退出，而 7 个 survivor
++   独立完成 scale-in。
++
++PyTorch 1.13 和 2.0 的 `SimpleElasticAgent.run()` 在 metrics 后还会为每个 worker 推导终态；
++STOPPED 结果按契约没有 return values 或 failures，基类推导会抛出 `ValueError`。因此自定义 agent
++仅对 STOPPED 跳过该不适用的 per-worker terminal event，其他成功/失败结果仍委托基类处理。
++
++## 实际修改
++
++- `bamboo/project_pactum/agent/api.py`
++  - 新增 `_stop_for_planned_removal()`，关闭 worker、设置 STOPPED 并返回合法 `RunResult`；
++  - `simulate_failure_node=1` 分支不再返回 `None`；
++  - STOPPED 结果跳过 TorchElastic 不兼容的 per-worker event 推导。
++- `tests/test_agent_lifecycle.py`
++  - 验证计划移除只停止一次、更新 group state、返回 STOPPED；
++  - 验证 STOPPED 不调用基类 event 推导；
++  - 静态拒绝 `_invoke_run()` 中重新出现 `return None`。
++- Aceso `experiments/correctness/run_cpu_tests.sh`
++  - elaceso 测试改为 discover，确保 lifecycle 与 rank-mapping 契约共同执行。
++
++Aceso 故障发布协议、survivor rendezvous 和 launcher 的 `failed_agents <= 1` 兼容规则未修改。
++修复后计划 agent 预期退出 0，因此新 run 的 `failed_agents` 应从 1 变为 0；旧兼容上限仍允许
++其他真实 agent 失败被判为失败。
++
++## 验证
++
++已完成历史取证：
++
++```bash
++git log -1 --format='%h %ad %s' --date=short ccd9bb09
++# ccd9bb0 2024-03-12 support for simulating failures
++```
++
++修复后的本地验证：
++
++```bash
++cd /Users/qdy/paper/elaceso
++python3 -m unittest discover -s tests -p 'test_*.py' -v
++# Ran 16 tests; OK
++
++python3 -m py_compile \
++  bamboo/project_pactum/agent/api.py \
++  bamboo/project_pactum/run/api.py \
++  tests/test_agent_lifecycle.py
++git diff --check
++# exit 0
++```
++
++同时核对 PyTorch 1.13.0 与 2.0.0 的 `RunResult`、metrics 和 worker-event 控制流，二者均具有
++STOPPED 状态和相同的 event 推导限制。
++
++Aceso 回归在排除本机无法导入 PyTorch 的既有 `test_tied_gradient_dp_contract` 后为 76 项通过、
++1 项按设计跳过；adjacent-recovery mock、DP/PP/TP 三组配置校验和 shell 语法检查均通过。
++
++目标 Linux/PyTorch 1.13 环境于 2026-09-19 完成 8→7 验证运行
++`correctness-livepipe-tp-seed1234-20260919-192522`：
++
++```bash
++grep -Hl "stopping worker group for planned removal of agent rank 4" \
++  "$RUN_DIR"/agent-gpu*.log
++# agent-gpu7.log（恰好一个文件）
++
++grep -HnE "NoneType.*is_failed|get_agent_status_event" \
++  "$RUN_DIR"/agent-gpu*.log
++# 无输出
++
++grep -l "worker group successfully finished" \
++  "$RUN_DIR"/agent-gpu*.log | wc -l
++# 7
++
++python experiments/correctness/audit_progress.py \
++  "$RUN_DIR"/progress-rank-*.jsonl \
++  --expected-world-size 8 \
++  --require-step-begin 3 \
++  --require-backward-complete 4 3 64 \
++  --output "$RUN_DIR/injection-audit.json"
++# valid=true, errors=[], records=38742
++```
++
++这证明逻辑 agent rank 4 所在的 `agent-gpu7` 进入计划 STOPPED 路径且未再以异常退出；其余
++7 个 agent 均正常完成。注入审计进一步确认：观察到原始 rank 0–7；rank 4 在 optimizer step 3
++开始后只完成 64 个 backward microbatch，且只提交 step 0–2；全局最终连续提交 step 0–9，
++7 个 survivor attempt 被正常中止并恢复。目标运行同时消除了 `NoneType.is_failed` 及其后续
++状态事件异常。
++
++## 风险与限制
++
++- 目标运行已验证 close 后由 `run()` finally 再次 shutdown 不会破坏本次计划移除；
++- planned STOPPED 不产生 per-worker terminal event；agent-level metrics 会把非 FAILED 结果
++  计为成功，这是“控制面按计划完成移除”的语义，不表示被终止 worker 完成了训练；
++- `failed_agents=0` 表示没有 agent 非零退出，不表示没有发生计划故障；本次被移除的逻辑
++  agent rank 仍是 4。
++
++## 回滚方式
++
++回滚 `_stop_for_planned_removal()`、STOPPED event 特例，并把模拟故障分支恢复为 `_stop_workers();
++return None`，即可恢复旧行为；这会确定性重新引入 `NoneType.is_failed`。
++
++## 关联资料
++
++- [BUG-2026-09-13-007](2026-09-13-project-pactum-status-event-api-mismatch.md)
++- [Aceso BUG-2026-09-13-005](../../../Aceso/docs/bugs/2026-09-13-reconfigure-keeps-old-send-frequency.md)
++- `bamboo/project_pactum/agent/api.py::ProjectPactumAgent._invoke_run()`
++- `../Aceso/megatron/schedules.py::_commit_backward_prefix()`（跨仓库触发端）
++- Aceso 失败运行：`/input/paper/Aceso/experiments/correctness/results/correctness-livepipe-pp-seed1234-20260913-101743`
++- 修复前最新复现：`/input/paper/Aceso/experiments/correctness/results/correctness-livepipe-tp-seed1234-20260919-184943/agent-gpu0.log`
++- 修复后验证：`/input/paper/Aceso/experiments/correctness/results/correctness-livepipe-tp-seed1234-20260919-192522`
+diff --git a/docs/bugs/2026-09-13-project-pactum-status-event-api-mismatch.md b/docs/bugs/2026-09-13-project-pactum-status-event-api-mismatch.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..595134309b5c88d03b00b7cf4540df312be03126
+--- /dev/null
++++ b/docs/bugs/2026-09-13-project-pactum-status-event-api-mismatch.md
+@@ -0,0 +1,141 @@
++# Project Pactum 异常遥测调用不存在的 agent API
++
++- Bug ID：BUG-2026-09-13-007
++- 状态：已验证
++- 首次发现：2026-09-13
++- 最后更新：2026-09-19
++- 影响仓库：elaceso；可遮蔽由 Aceso 或其他 worker/agent 路径产生的原始异常
++- 基线分支/commit：`dev-cx` / `5e6f1ad2b7c22c8c3e7c9dc85b81f92bea680c71`
++- 引入/相关 commit：`c763df77`（2023-06-29，`include bamboo`）；`d1f7971a`（2023-12-20，`support torch 2.0`）只移除了成功路径调用
++- 当前修复：工作区改动，尚无 commit/PR
++- 关联运行：`correctness-livepipe-pp-seed1234-20260913-101743`、`correctness-livepipe-tp-seed1234-20260919-184943`、`correctness-livepipe-tp-seed1234-20260919-192522`
++- 运行环境：Linux、Python 3.8、PyTorch 1.13、`PYTORCH2=0`、Project Pactum；本地 macOS 无 PyTorch
++
++## 现象与影响
++
++`launch_agent()` 捕获 agent 构造后的普通异常时，又调用 `ProjectPactumAgent` 不存在的方法，产生新的顶层异常：
++
++```text
++AttributeError: 'ProjectPactumAgent' object has no attribute 'get_agent_status_event'
++```
++
++这会把任何非 `ChildFailedError` 的原始异常包在第二层 API 异常下面，可能使日志聚合、error-file 选择或只读取末尾异常的审计工具误报根因，并且失败事件没有按预期记录。
++
++## 触发条件
++
++1. `launch_agent()` 已成功构造 `agent`；
++2. `agent.run()` 或之后的结果处理抛出非 `ChildFailedError`；
++3. 通用 `except Exception` 分支执行 `agent.get_agent_status_event(WorkerState.FAILED)`；
++4. 自定义 agent 及工作区内其他类均未定义该方法。
++
++现场由 [BUG-2026-09-13-006](2026-09-13-project-pactum-none-run-result.md) 的 `NoneType.is_failed` 进入此分支，但该触发源不是必要条件。
++
++## 原始证据
++
++责任代码位于 `bamboo/project_pactum/run/api.py::launch_agent()`：
++
++```python
++except Exception:
++    if agent:
++        events.record(agent.get_agent_status_event(WorkerState.FAILED))
++    else:
++        events.record(_construct_event(config))
++    raise
++```
++
++同文件已经定义 launcher 自有 `_construct_event(config)`。工作区搜索仅找到 `get_agent_status_event` 的调用，没有找到定义；成功路径的同名调用已被注释，异常路径仍启用。现场最外层栈与该代码完全一致。
++
++## 根因、首因与级联
++
++首因是 launcher 假定自定义 `ProjectPactumAgent` 提供某个 PyTorch/旧实现的 status-event API，但没有实现、适配或按能力检测。`PYTORCH2` 开关只处理其他签名差异，未覆盖 event API。
++
++`d1f7971a` 为 PyTorch 2 兼容时注释了成功路径调用，却遗漏异常路径，说明兼容迁移不完整。`NoneType.is_failed` 是本次现场进入异常分支的前序错误，但 BUG-007 可由任意普通 agent 异常独立触发，因此必须单独建档。
++
++## 修复方案与设计理由
++
++通用异常分支改为显式兼容适配：若 agent 提供 PyTorch 1.13/2.0 的
++`get_event_failed()`，使用其完整 failure event；否则回退到 launcher 自身的
++`_construct_event(config, state="FAILED")`。事件构造、记录甚至告警日志都处于 best-effort
++保护中，最后使用裸 `raise` 重抛原始异常。
++
++不能通过吞掉原始异常或把所有异常转换成 `ChildFailedError` 来规避；后者会改变 TorchElastic error-file 和 worker failure 语义。
++
++## 实际修改
++
++- `bamboo/project_pactum/run/api.py`
++  - 删除不存在的 `get_agent_status_event()` 调用及其旧注释；
++  - `_construct_event()` 支持携带 failure state；
++  - 新增 `_record_failure_event()`，优先使用 `get_event_failed()`，无该 API 时回退；
++  - 遥测失败只记录 best-effort warning，不能替换原异常。
++- `tests/test_agent_lifecycle.py`
++  - 覆盖支持 API、无 API 回退和 telemetry recorder 自身失败；
++  - 验证 `launch_agent()` 通用异常分支最后仍为裸 `raise`；
++  - 静态拒绝重新引入 `get_agent_status_event`。
++
++## 验证
++
++已完成静态取证：
++
++```bash
++git log -1 --format='%h %ad %s' --date=short c763df77
++git log -1 --format='%h %ad %s' --date=short d1f7971a
++# c763df7 2023-06-29 include bamboo
++# d1f7971 2023-12-20 support torch 2.0
++```
++
++修复后的本地验证：
++
++```bash
++cd /Users/qdy/paper/elaceso
++python3 -m unittest discover -s tests -p 'test_*.py' -v
++# Ran 16 tests; OK
++
++python3 -m py_compile \
++  bamboo/project_pactum/agent/api.py \
++  bamboo/project_pactum/run/api.py \
++  tests/test_agent_lifecycle.py
++git diff --check
++# exit 0
++```
++
++源码已与 PyTorch 1.13.0 和 2.0.0 的实际 failure-event API 对照；两个版本均提供
++`get_event_failed()`，不提供旧调用。
++
++Aceso 回归在排除本机无法导入 PyTorch 的既有 `test_tied_gradient_dp_contract` 后为 76 项通过、
++1 项按设计跳过；adjacent-recovery mock、DP/PP/TP 三组配置校验和 shell 语法检查均通过。
++
++目标 Linux/PyTorch 1.13 环境的验证运行
++`correctness-livepipe-tp-seed1234-20260919-192522` 中，计划移除日志恰好出现在
++`agent-gpu7.log`，7 个 survivor agent 均记录 `worker group successfully finished`，并且：
++
++```bash
++grep -HnE "NoneType.*is_failed|get_agent_status_event" \
++  "$RUN_DIR"/agent-gpu*.log
++# 无输出
++```
++
++该结果验证了原现场的双重 traceback 已消失且没有 lifecycle 回归。独立普通异常的
++failure-event 分支通过 `tests/test_agent_lifecycle.py` 中的 API、回退和 recorder 失败用例验证；
++目标运行没有为了验证遥测而额外注入无关异常。
++
++## 风险与限制
++
++- 通用回退事件仅包含 rendezvous、role 和 FAILED state，不如 agent 原生事件详细；支持
++  `get_event_failed()` 的目标 PyTorch 1.13 会优先走原生事件；
++- 遥测为 best effort，事件后端失败时会保留原异常但可能丢失 failure event；
++- 遥测修复不代表任意 worker 原始异常本身被恢复。
++
++## 回滚方式
++
++回滚 `_record_failure_event()` 并恢复 `agent.get_agent_status_event(...)` 会重新引入确定的
++AttributeError，并可能再次遮蔽原始异常。
++
++## 关联资料
++
++- [BUG-2026-09-13-006](2026-09-13-project-pactum-none-run-result.md)
++- [Aceso BUG-2026-09-13-005](../../../Aceso/docs/bugs/2026-09-13-reconfigure-keeps-old-send-frequency.md)
++- `bamboo/project_pactum/run/api.py::_construct_event()`
++- `bamboo/project_pactum/run/api.py::launch_agent()`
++- Aceso 失败运行：`/input/paper/Aceso/experiments/correctness/results/correctness-livepipe-pp-seed1234-20260913-101743`
++- 修复前最新复现：`/input/paper/Aceso/experiments/correctness/results/correctness-livepipe-tp-seed1234-20260919-184943/agent-gpu0.log`
++- 修复后验证：`/input/paper/Aceso/experiments/correctness/results/correctness-livepipe-tp-seed1234-20260919-192522`
+diff --git a/docs/bugs/README.md b/docs/bugs/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..ff6080fe7ed4a9cfa590f375d9348a8e9edf3ebd
+--- /dev/null
++++ b/docs/bugs/README.md
+@@ -0,0 +1,14 @@
++# elaceso Bug 记录
++
++本目录记录 elaceso 中已确认的独立缺陷。相同根因持续更新同一文档；跨仓库触发场景链接到责任仓库文档。
++
++## 索引
++
++| Bug ID | 状态 | 标题 | 首次发现 |
++| --- | --- | --- | --- |
++| BUG-2026-09-13-006 | 已验证 | [Project Pactum 计划故障分支返回 `None`](2026-09-13-project-pactum-none-run-result.md) | 2026-09-13 |
++| BUG-2026-09-13-007 | 已验证 | [Project Pactum 异常遥测调用不存在的 agent API](2026-09-13-project-pactum-status-event-api-mismatch.md) | 2026-09-13 |
++| BUG-2026-09-13-008 | 已验证 | [Project Pactum rank lease 过期误报 failed rank](2026-09-13-project-pactum-lease-false-failure.md) | 2026-09-13 |
++| BUG-2026-09-19-015 | 已验证 | [Project Pactum 将 scale-in 尾部等待成员误判为 scale-out](2026-09-19-project-pactum-scale-in-misclassified-as-scale-out.md) | 2026-09-19 |
++
++状态使用：`已发现`、`根因已确认`、`修复已实施，待验证`、`已验证`、`已关闭`。
+diff --git a/docs/review-supplementary-commits.md b/docs/review-supplementary-commits.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..d3c353ac54d3e759327e96d5491cef84037b6506
+--- /dev/null
++++ b/docs/review-supplementary-commits.md
+@@ -0,0 +1,30 @@
++# 补充实验 commit 审查记录（dev-cx，elaceso 侧）
++
++审查对象：`07a3e89`（2026-08-30，"update local changes for supplementary experiments"）。完整的跨仓库审查、问题清单与 `debug.md` 对照见 `Aceso/docs/review-supplementary-commits.md`。
++
++## 1. 结论
++
++去掉每节点 4 GPU 硬编码的改动方向正确且必要：worker 用 etcd 里的 `num_alive_ranks` 作为恢复期 `init_process_group` 的 `world_size`，旧的硬编码会让"一卡一 agent"的布局永久挂起。问题集中在配套：漏提交测试文件、rendezvous 参数被覆盖、故障键重置顺序。
++
++## 2. 已在本分支修复
++
++| 编号 | 问题 | 位置 | 修复 |
++| --- | --- | --- | --- |
++| E1 | `rank_mapping.py` 文档声称"可在 CPU 上单测"，Aceso 的 `run_cpu_tests.sh` 也引用 `tests/test_rank_mapping.py`，但仓库里没有 `tests/` 目录；按 Aceso README 设置 `ELACESO_ROOT` 后 CPU 测试必失败。 | 新增 `tests/test_rank_mapping.py` | 按路径加载模块，不依赖 torch/etcd；覆盖 1 GPU/agent、4 GPU/agent、scale-out、非法参数。 |
++| E2 | `ProjectPactumLaunchConfig.__post_init__` 无条件覆盖 `last_call_timeout=5` 与 `timeout`，`--rdzv_conf=last_call_timeout=30,timeout=900` 被静默丢弃。配合 Aceso 脚本的 `--nnodes=7:8`，第 8 个 agent 晚 5 s 以上就以 7 个 agent 收口，worker 随即因 world_size 不等于 GPU 数崩掉。 | `bamboo/project_pactum/run/api.py` | 改为 `setdefault`，CLI 值优先，默认值不变。 |
++| E3 | 重配置后 agent 先写 `should_reconfigure=0` 再写 `failed_rank=-1`；worker 在 `wait_agent_to_rendezvous` 里一看到前者就继续，第一次 p2p 轮询可能读到旧的 `failed_rank` 再次逃逸（对应 `debug.md` 第十四轮的键残留现象）。 | `bamboo/project_pactum/agent/api.py` | 调换两行顺序；Aceso 侧 worker 另做了幂等清键。 |
++
++## 3. 未修复的问题与疑点
++
++| 编号 | 问题 | 说明 |
++| --- | --- | --- |
++| EU1 | `build_worker_rank_mapping` 对越界或为 None 的 `failed_node_rank` 抛 `ValueError`，调用点在 agent 监控循环 `reconfigure_rendezvous` → `next_rendezvous_new` 里没有捕获，会直接杀掉 agent；旧代码是静默算出错误映射。 | 行为变化可以接受，但应在 `generate_rank_mapping` 处捕获并打日志。 |
++| EU2 | worker 侧 `training.py` 的 `local_world_size` 取自 `--num-gpus-per-node`，agent 侧取自 `--nproc_per_node`，两处没有一致性校验；不一致时 worker 自己算的映射与 etcd 里 agent 写的映射不同（当前 worker 实际用配置文件的映射，etcd 值只用于 `num_alive_ranks`）。 | 建议 agent 把 `local_world_size` 写进 etcd，worker 启动时核对。 |
++| EU3 | 收到 `simulate_failure_node*=1` 后 agent `_stop_workers()` 然后 `return None`，该 agent 就此退出，不会再加入；`--max_restarts=0` 语义下 `debug.md` 第十六轮观察到的"agent 重启了 worker 世代"与此矛盾，未能在本地定位。 | 需要在 GPU 环境结合 agent 日志确认。 |
++| EU4 | `debug.md` 第十六轮：worker 日志文件被 truncate 并出现 NUL 空洞（新旧 fd 交错写）。 | 建议按世代分文件；本分支未改日志处理。 |
++| EU5 | README 说环境是 `bamboo/Dockerfile`（PyTorch 1.13），Aceso 的 README 指向 `docker_files/Dockerfile-torch-1-10`（PyTorch 1.10）；README 要求 `PYTORCH2=0`，Aceso 脚本此前不设（Aceso 侧已改为默认导出）。 | 建议统一为 1.13 镜像。 |
++| EU6 | `check_failed_rank` 依赖 rendezvous keep-alive 缺失来判死，时延为秒级；Aceso 侧已改为被注入 worker 自己先写 `failed_rank`，agent 读到非负值会跳过检测，两侧逻辑兼容。 | 记录以便对照。 |
++
++## 4. 验证
++
++`python -m unittest tests/test_rank_mapping.py`：5 个用例通过。`python -m py_compile` 覆盖两个改动文件。没有 GPU，E2/E3 只做了静态确认。
+diff --git a/tests/test_rank_mapping.py b/tests/test_rank_mapping.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..dda76b70698352069cb7fd97b44217d2951a10ad
+--- /dev/null
++++ b/tests/test_rank_mapping.py
+@@ -0,0 +1,96 @@
++"""CPU unit tests for project_pactum.rendezvous.rank_mapping.
++
++Invoked by Aceso/experiments/correctness/run_cpu_tests.sh as
++``python3 -m unittest tests/test_rank_mapping.py``.  The module is loaded by
++path so that the test needs neither torch nor etcd.
++"""
++import importlib.util
++from pathlib import Path
++import unittest
++
++_PATH = Path(__file__).resolve().parents[1] / (
++    "bamboo/project_pactum/rendezvous/rank_mapping.py"
++)
++_SPEC = importlib.util.spec_from_file_location("rank_mapping", _PATH)
++rank_mapping = importlib.util.module_from_spec(_SPEC)
++_SPEC.loader.exec_module(rank_mapping)
++build_worker_rank_mapping = rank_mapping.build_worker_rank_mapping
++should_start_scale_out = rank_mapping.should_start_scale_out
++
++
++class BuildWorkerRankMappingTests(unittest.TestCase):
++    def test_one_gpu_per_agent_scale_in(self):
++        # The LivePipe single-node scripts run one agent per GPU; losing agent
++        # 4 of 8 must remove exactly one worker rank.
++        mapping, alive = build_worker_rank_mapping(8, 4, local_world_size=1)
++        self.assertEqual(alive, 7)
++        self.assertEqual(
++            [mapping[rank] for rank in range(8)], [0, 1, 2, 3, -1, 4, 5, 6]
++        )
++
++    def test_four_gpus_per_agent_scale_in(self):
++        # The original hard-coded layout: one dead agent removes four workers.
++        mapping, alive = build_worker_rank_mapping(5, 1, local_world_size=4)
++        self.assertEqual(alive, 16)
++        self.assertEqual([mapping[r] for r in range(4)], [0, 1, 2, 3])
++        self.assertEqual([mapping[r] for r in range(4, 8)], [-1] * 4)
++        self.assertEqual([mapping[r] for r in range(8, 20)], list(range(4, 16)))
++
++    def test_surviving_ranks_are_dense_and_ordered(self):
++        for failed in range(8):
++            mapping, alive = build_worker_rank_mapping(8, failed, 1)
++            survivors = [new for old, new in sorted(mapping.items()) if new >= 0]
++            self.assertEqual(survivors, list(range(alive)))
++
++    def test_scale_out_is_identity(self):
++        mapping, alive = build_worker_rank_mapping(
++            7, None, local_world_size=1, num_nodes_waiting=1
++        )
++        self.assertEqual(alive, 8)
++        self.assertEqual(mapping, {rank: rank for rank in range(8)})
++
++    def test_invalid_arguments_are_rejected(self):
++        with self.assertRaises(ValueError):
++            build_worker_rank_mapping(0, 0, 1)
++        with self.assertRaises(ValueError):
++            build_worker_rank_mapping(8, 4, 0)
++        with self.assertRaises(ValueError):
++            build_worker_rank_mapping(8, 8, 1)
++        with self.assertRaises(ValueError):
++            build_worker_rank_mapping(8, -1, 1)
++        with self.assertRaises(ValueError):
++            build_worker_rank_mapping(8, None, 1)
++        with self.assertRaises(ValueError):
++            build_worker_rank_mapping(8, 4, 1, num_nodes_waiting=-1)
++
++    def test_failure_recovery_wins_over_waiting_node(self):
++        self.assertFalse(should_start_scale_out(1, "1", 4, True))
++        self.assertFalse(should_start_scale_out(1, "0", 4, True))
++
++    def test_scale_out_requires_an_explicit_configuration(self):
++        self.assertFalse(should_start_scale_out(1, "0", -1, False))
++        self.assertTrue(should_start_scale_out(1, "0", -1, True))
++
++    def test_scale_out_requires_a_waiting_node(self):
++        self.assertFalse(should_start_scale_out(0, "0", -1, True))
++
++    def test_agent_routes_membership_changes_through_the_guard(self):
++        agent_source = (
++            Path(__file__).resolve().parents[1]
++            / "bamboo/project_pactum/agent/api.py"
++        ).read_text(encoding="utf-8")
++        self.assertIn("scale_out_configured = False", agent_source)
++        self.assertNotIn("scale_out_configured = True", agent_source)
++        self.assertIn(
++            "scale_out_requested = should_start_scale_out(", agent_source
++        )
++        self.assertIn(
++            'if scale_out_requested and ready_flag == "1":', agent_source
++        )
++        self.assertNotIn(
++            'if num_nodes_waiting > 0 and ready_flag == "1":', agent_source
++        )
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/docs/bugs/2026-09-19-project-pactum-scale-in-misclassified-as-scale-out.md b/docs/bugs/2026-09-19-project-pactum-scale-in-misclassified-as-scale-out.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..ffc2051c6c3cf96e083ebb187187cec0af2a10e0
+--- /dev/null
++++ b/docs/bugs/2026-09-19-project-pactum-scale-in-misclassified-as-scale-out.md
+@@ -0,0 +1,231 @@
++# Project Pactum 将 scale-in 尾部等待成员误判为 scale-out
++
++- Bug ID：BUG-2026-09-19-015
++- 状态：已验证
++- 首次发现：2026-09-19
++- 最后更新：2026-09-19
++- 影响仓库：elaceso（控制面首因）和相邻 Aceso（worker 侧防御）
++- elaceso 基线分支/commit：`dev-cx` / `5e6f1ad2b7c22c8c3e7c9dc85b81f92bea680c71`
++- Aceso 基线分支/commit：`dev-cx` / `363bd5ed73fa1185d9cbe3b4a560ed8fb5e355d8`；目标内容包含 `56ea6aac959a0c008b9bedb524ec60fb5300e96e`
++- 当前修复：两个工作区的未提交改动，尚无 commit/PR
++- 失败运行：`correctness-livepipe-tp-seed1234-20260919-171743`
++- 通过验收：`correctness-livepipe-tp-seed1234-20260919-184943`
++- 对照运行：`correctness-livepipe-tp-seed1234-20260919-165245`（独立的 NCCL SHM teardown 问题）
++- 运行目录：`/input/paper/Aceso/experiments/correctness/results/<RUN_ID>`
++- 短 profile：`TRAIN_ITERS=10 FAILURE_ITER=3 FAIL_AFTER_BACKWARDS=64`，单机 8→7 GPU，恢复后 mixed TP/DP
++
++## 现象与影响
++
++`171743` 使用 `NCCL_TRANSPORT=socket`，已越过计划故障后的 8→7 rendezvous、
++process-group 重建、模型迁移和恢复 barrier，并开始 iteration 4。随后 survivor 却意外进入
++`training.py` 的 scale-out 分支，再次销毁并初始化 process group。
++
++第二次初始化最终失败：
++
++```text
++RuntimeError: Timed out initializing process group in store based barrier
++on rank: 4, for key: store_based_barrier_key:1
++(world_size=7, worker_count=13, timeout=0:10:00)
++```
++
++`worker_count=13` 与同一 store/barrier key 中上一轮 7 个参与者计数加第二轮到达的
++6 个 survivor 一致。该 barrier 要求 `world_size=7`，计数已经超过目标，不可能自行恢复。
++worker 超时退出后，agent 又观测到 rank 3 缺失并写入 `failed_rank=3`；这是重复
++rendezvous 导致的级联故障，不是本轮计划注入的原始故障。
++
++影响是一次已经成功完成的 scale-in 被错误转换成第二次 membership change。训练无法继续，
++等待更长时间也不能恢复，只能终止整个 run。
++
++## 触发条件与时间线
++
++需要同时满足：
++
++1. 作业启用 Project Pactum elastic/reconfiguration；
++2. 发生一次 scale-in，恢复窗口内 `num_nodes_waiting()` 短暂大于 0；
++3. 作业没有提供 `--elastic-new-config-scale-out`，本来不具备扩容能力；
++4. agent 把 waiting node 无条件解释成 scale-out，并发布根级 `scale_out=1`；
++5. Aceso worker 只读取该标志，没有核对本作业是否配置了 scale-out。
++
++`171743` 的关键顺序是：
++
++```text
++iteration 3 中注入计划故障
++  -> 8→7 rendezvous 完成
++  -> 7-rank process group / 模型迁移 / barrier 完成
++  -> iteration 4 开始
++  -> 陈旧 scale_out 标志触发第二次 reconfiguration
++  -> store_based_barrier_key:1 得到 worker_count=13
++  -> 600 秒后 rank 4 超时
++  -> agent 将后续退出的 rank 3 识别为新 failed rank
++```
++
++对照运行 `165245` 使用默认 `NCCL_TRANSPORT=shm`，部分 rank 在
++`destroy_process_group()` 阶段超时，未完成第一次 8→7。它属于 NCCL SHM teardown
++问题，不是本 bug 的复现证据；本 bug 只有在使用 socket 越过 teardown 后才暴露。
++
++## 根因
++
++控制面把“观测到等待成员”直接等价为“用户请求扩容”，没有建立以下优先级和能力约束：
++
++```text
++failure recovery / scale-in > waiting-node observation
++explicit scale-out configuration > scale_out control flag
++```
++
++具体有两层缺口：
++
++1. `ProjectPactumAgent._invoke_run()` 在读取并判断 `should_reconfigure`、`failed_rank`
++   之前，只要 `num_nodes_waiting > 0` 就由 group rank 0 写入 `scale_out=1`；scale-in
++   完成时也没有可靠清除此标志。
++2. Aceso `need_scale_out()` 无条件信任 etcd 中的 `scale_out`。即使命令行没有
++   `--elastic-new-config-scale-out`，陈旧标志仍可使 survivor 进入 scale-out 分支。
++
++这些根级键不携带 rendezvous generation 或操作类型，因此一个恢复窗口中的瞬时观测会泄漏到
++下一次训练循环。`ready_for_rendezvous_rank*` 全部为 1 只表示 worker 已到控制点，不能证明
++当前操作确实是用户配置的 scale-out。
++
++## 修复方案与设计理由
++
++修复同时约束生产者和消费者，采用 fail-closed 语义：
++
++1. elaceso 新增纯函数 `should_start_scale_out()`；只有 waiting count 大于 0、显式配置了
++   scale-out、当前不在 reconfiguration 中且没有 failed rank 时才返回 true。
++2. agent 从 rendezvous capability key `new_config_scale_out` 判断作业是否支持扩容；键缺失、
++   空字符串、`None` 或字符串 `"None"` 均视为未配置。读取失败也拒绝扩容。
++3. failure/recovery 路径优先于 waiting-node 路径；不满足扩容条件时 group rank 0 清除
++   `scale_out`，scale-in rendezvous 完成时再次清除。
++4. Aceso `need_scale_out()` 在 `args.elastic_new_config_scale_out is None` 时直接返回 false，
++   且不读取 etcd。即使生产者或旧 run 留下陈旧标志，未配置扩容的 worker 也不会进入分支。
++5. 显式传入 `--elastic-new-config-scale-out <config>` 的已有扩容路径仍读取并服从
++   `scale_out`；本次没有删除 scale-out 功能。
++
++双层校验是必要的：agent 修复阻止错误状态发布，worker 修复则为已存在的陈旧外部状态和
++混合版本部署提供最后一道能力边界。
++
++## 实际修改
++
++elaceso：
++
++- `bamboo/project_pactum/agent/api.py`
++  - 删除 `num_nodes_waiting > 0` 时无条件发布 `scale_out=1` 的逻辑；
++  - 读取 `new_config_scale_out` capability；
++  - 使用 `should_start_scale_out()` 统一决定是否进入扩容 rendezvous；
++  - recovery 优先，并在拒绝扩容或完成 scale-in 时清除陈旧标志。
++- `bamboo/project_pactum/rendezvous/rank_mapping.py`
++  - 新增无副作用的 `should_start_scale_out()` 判定函数。
++- `tests/test_rank_mapping.py`
++  - 覆盖故障优先级、显式配置要求、waiting-node 要求、缺键 fail-closed 和 agent 接线。
++
++Aceso：
++
++- `megatron/elaceso.py`
++  - `need_scale_out()` 在没有 `elastic_new_config_scale_out` 时立即返回 false。
++- `tests/test_review_fixes.py`
++  - 覆盖未配置时忽略陈旧标志，以及配置后仍正确读取 0/1 控制标志。
++
++没有修改模型迁移、rank mapping、恢复数据前缀、真实 scale-out 配置格式或 failure injection
++语义。
++
++## 本地验证
++
++修复后的定向测试：
++
++```bash
++cd /Users/qdy/paper/Aceso
++python3 -m unittest tests.test_review_fixes
++# Ran 18 tests; OK
++
++cd /Users/qdy/paper/elaceso
++python3 -m unittest tests.test_rank_mapping
++# Ran 9 tests; OK
++```
++
++语法和 diff 校验：
++
++```bash
++python3 -m py_compile \
++  bamboo/project_pactum/agent/api.py \
++  bamboo/project_pactum/rendezvous/rank_mapping.py \
++  tests/test_rank_mapping.py
++
++python3 -m py_compile \
++  megatron/elaceso.py \
++  tests/test_review_fixes.py
++
++git diff --check
++# 两个仓库均为 exit 0
++```
++
++本地环境没有目标 PyTorch/Apex/CUDA/真实 etcd，以上测试只能验证控制契约；最终状态由下述
++目标环境运行决定。
++
++## 目标环境验收
++
++同步两个仓库的 dirty diff 后，必须使用新的 run ID；不能复用 `171743` 的 etcd/store
++generation。由于默认 SHM teardown 仍是独立已知问题，本轮使用 socket：
++
++```bash
++cd /input/paper/Aceso
++TRAIN_ITERS=10 FAILURE_ITER=3 NCCL_TRANSPORT=socket \
++  bash experiments/correctness/run_single_node_8gpu.sh livepipe-tp
++```
++
++通过条件：
++
++- iteration 3 只发生预期的 preserve-prefix 重放；
++- 只有一次 8→7 membership change，7 个 survivor 完成重建和迁移；
++- 日志中不出现 `[SCALE-OUT]` 或第二次 scale-out rendezvous；
++- 不再出现 `worker_count > world_size` 的 store-based barrier；
++- iteration 4 到 9 正常提交并结束；
++- 最终 `failed_agents` 不大于计划注入造成的一个 agent；
++- `audit_progress.py` 对该 run 返回 `valid=true`、`errors=[]`。
++
++### 实际验收结果：run `184943`
++
++修复同步后，`184943` 使用上述短 profile 和 `NCCL_TRANSPORT=socket` 完成目标环境验收：
++
++- 7 个 survivor 日志均包含 `worker group successfully finished`；
++- reconfiguration 总时间为 53.86–54.00 秒；
++- 新 rank 0–6 全部开始并完成 iteration 4–9；
++- 日志没有 `[SCALE-OUT]`，也没有 `Timed out initializing process group`；
++- run 结束后 `pgrep -af <RUN_ID>` 无残留进程；
++- `audit_progress.py` 读取 38,740 条记录，结果为 `valid=true`、`errors=[]`；
++- 审计观察到 7 个 aborted attempts；计划失败的旧 rank 4 提交 0–2、开始 iteration 3，
++  并精确停在 `backward_max_by_rank_step["4:3"]=64`；最终 committed steps 为 0–9。
++
++物理 `agent-gpu0.log` 是初始 rendezvous 分配到逻辑 agent rank 4 的计划失败进程。该 run
++使用 BUG-006/007 修复前的代码，仍出现
++[BUG-006](2026-09-13-project-pactum-none-run-result.md) 的 `NoneType.is_failed`，随后被
++[BUG-007](2026-09-13-project-pactum-status-event-api-mismatch.md) 的遥测异常遮蔽；其余 7 个
++agent 正常完成，因此这两个退出日志问题没有阻断本次 BUG-015 验收，也不属于 BUG-015
++修复范围；两项后续补丁已实施，状态见各自文档。
++
++本轮证明无 scale-out 配置的 8→7 LivePipe TP 恢复不会再因 waiting-node 瞬态或陈旧标志
++触发第二次 membership change。显式配置的真实 scale-out 路径不在本轮动态验收范围内。
++
++## 遗留风险与限制
++
++- fail-closed 会使不写 `new_config_scale_out` capability 的旧 launcher 无法动态扩容；这是本次
++  有意选择。需要扩容的作业必须显式传入 `--elastic-new-config-scale-out`。
++- `scale_out`、`failed_rank` 和 ready flags 仍是非 generation-scoped 根级键。显式配置了
++  scale-out 的长期 elastic 作业仍应进一步改成带 generation 的状态机。
++- `NCCL_TRANSPORT=socket` 是本轮单机 fail-stop 验收的运行要求，不是本 bug 对 SHM
++  teardown 的修复。
++- 当前控制面仍以单个整数表达 failed rank；多 rank 并发故障不在本次范围。
++
++## 回滚方式
++
++回滚 agent capability/优先级判断、`should_start_scale_out()`、scale-in 后的标志清理，以及
++Aceso `need_scale_out()` 的配置门禁即可恢复旧行为。这样会重新允许恢复窗口中的 waiting node
++触发未配置的扩容，因此不建议只回滚任意一侧。
++
++## 关联资料
++
++- Aceso `megatron/elaceso.py`
++- Aceso `megatron/training.py` 的 scale-in / scale-out 分支
++- elaceso `bamboo/project_pactum/agent/api.py`
++- elaceso `bamboo/project_pactum/rendezvous/rank_mapping.py`
++- 失败运行目录：`/input/paper/Aceso/experiments/correctness/results/correctness-livepipe-tp-seed1234-20260919-171743`
++- 通过运行目录：`/input/paper/Aceso/experiments/correctness/results/correctness-livepipe-tp-seed1234-20260919-184943`
++- 通过审计：`/input/paper/Aceso/experiments/correctness/results/correctness-livepipe-tp-seed1234-20260919-184943/audit.json`
++- 对照运行目录：`/input/paper/Aceso/experiments/correctness/results/correctness-livepipe-tp-seed1234-20260919-165245`
+diff --git a/tests/test_agent_lifecycle.py b/tests/test_agent_lifecycle.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a3c2e83f4eca07540877b8e7aa4a2ccd261276bb
+--- /dev/null
++++ b/tests/test_agent_lifecycle.py
+@@ -0,0 +1,196 @@
++"""CPU contract tests for Project Pactum agent lifecycle compatibility.
++
++The production modules import torch and etcd.  These tests execute only the
++small lifecycle helpers from their AST so they also run on review machines
++without those dependencies.
++"""
++import ast
++from pathlib import Path
++import types
++import unittest
++
++
++_ROOT = Path(__file__).resolve().parents[1]
++_AGENT_PATH = _ROOT / "bamboo/project_pactum/agent/api.py"
++_RUN_PATH = _ROOT / "bamboo/project_pactum/run/api.py"
++
++
++def _tree(path):
++    return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
++
++
++def _method(path, class_name, method_name, namespace):
++    tree = _tree(path)
++    class_node = next(
++        node for node in tree.body
++        if isinstance(node, ast.ClassDef) and node.name == class_name
++    )
++    method_node = next(
++        node for node in class_node.body
++        if isinstance(node, ast.FunctionDef) and node.name == method_name
++    )
++    method_node.decorator_list = []
++    module = ast.Module(body=[method_node], type_ignores=[])
++    ast.fix_missing_locations(module)
++    exec(compile(module, str(path), "exec"), namespace)
++    return namespace[method_name], method_node
++
++
++def _function(path, function_name, namespace):
++    tree = _tree(path)
++    function_node = next(
++        node for node in tree.body
++        if isinstance(node, ast.FunctionDef) and node.name == function_name
++    )
++    function_node.decorator_list = []
++    module = ast.Module(body=[function_node], type_ignores=[])
++    ast.fix_missing_locations(module)
++    exec(compile(module, str(path), "exec"), namespace)
++    return namespace[function_name], function_node
++
++
++class _RunResult:
++    def __init__(self, state):
++        self.state = state
++
++    def is_failed(self):
++        return self.state == "FAILED"
++
++
++class _Logger:
++    def __init__(self):
++        self.messages = []
++
++    def info(self, *args):
++        self.messages.append(args)
++
++    def warning(self, *args):
++        self.messages.append(args)
++
++
++class AgentPlannedRemovalTests(unittest.TestCase):
++    def setUp(self):
++        self.states = types.SimpleNamespace(STOPPED="STOPPED")
++        self.logger = _Logger()
++
++    def test_planned_removal_returns_stopped_run_result(self):
++        stop_for_removal, _ = _method(
++            _AGENT_PATH,
++            "ProjectPactumAgent",
++            "_stop_for_planned_removal",
++            {
++                "RunResult": _RunResult,
++                "WorkerState": self.states,
++                "log": self.logger,
++            },
++        )
++        group = types.SimpleNamespace(group_rank=4, state="HEALTHY")
++        calls = []
++        agent = types.SimpleNamespace(
++            _worker_group=group,
++            _stop_workers=lambda: calls.append("stop"),
++        )
++
++        result = stop_for_removal(agent, "default")
++
++        self.assertEqual(calls, ["stop"])
++        self.assertEqual(group.state, self.states.STOPPED)
++        self.assertEqual(result.state, self.states.STOPPED)
++        self.assertFalse(result.is_failed())
++
++    def test_stopped_workers_skip_incompatible_base_event_inference(self):
++        record_events, _ = _method(
++            _AGENT_PATH,
++            "ProjectPactumAgent",
++            "_record_worker_events",
++            {"RunResult": _RunResult, "WorkerState": self.states},
++        )
++        self.assertIsNone(
++            record_events(object(), _RunResult(self.states.STOPPED))
++        )
++
++    def test_invoke_run_no_longer_returns_none_for_planned_removal(self):
++        _, method_node = _method(
++            _AGENT_PATH,
++            "ProjectPactumAgent",
++            "_invoke_run",
++            {
++                "DEFAULT_ROLE": "default",
++                "RunResult": _RunResult,
++            },
++        )
++        source = ast.get_source_segment(
++            _AGENT_PATH.read_text(encoding="utf-8"), method_node
++        )
++        self.assertIn("return self._stop_for_planned_removal(role)", source)
++        self.assertNotIn("return None", source)
++
++
++class LauncherFailureEventTests(unittest.TestCase):
++    def _load_helper(self, recorder, construct_event=None):
++        logger = _Logger()
++        events = types.SimpleNamespace(record=recorder)
++        helper, _ = _function(
++            _RUN_PATH,
++            "_record_failure_event",
++            {
++                "ProjectPactumLaunchConfig": object,
++                "events": events,
++                "logger": logger,
++                "_construct_event": construct_event or (
++                    lambda config, state=None: (config, state)
++                ),
++            },
++        )
++        return helper, logger
++
++    def test_uses_supported_agent_failure_event_api(self):
++        recorded = []
++        helper, _ = self._load_helper(recorded.append)
++        agent = types.SimpleNamespace(get_event_failed=lambda: "agent-event")
++
++        helper(agent, object())
++
++        self.assertEqual(recorded, ["agent-event"])
++
++    def test_falls_back_to_launcher_event_without_agent_api(self):
++        recorded = []
++        helper, _ = self._load_helper(recorded.append)
++        config = object()
++
++        helper(object(), config)
++
++        self.assertEqual(recorded, [(config, "FAILED")])
++
++    def test_telemetry_failure_is_best_effort(self):
++        def fail_to_record(event):
++            raise RuntimeError("telemetry unavailable")
++
++        helper, logger = self._load_helper(fail_to_record)
++
++        self.assertIsNone(helper(None, object()))
++        self.assertTrue(logger.messages)
++
++    def test_launch_agent_preserves_the_original_exception(self):
++        source = _RUN_PATH.read_text(encoding="utf-8")
++        self.assertNotIn("get_agent_status_event", source)
++        tree = _tree(_RUN_PATH)
++        launch_agent = next(
++            node for node in tree.body
++            if isinstance(node, ast.FunctionDef) and node.name == "launch_agent"
++        )
++        generic_handlers = [
++            node for node in ast.walk(launch_agent)
++            if isinstance(node, ast.ExceptHandler)
++            and isinstance(node.type, ast.Name)
++            and node.type.id == "Exception"
++        ]
++        handler = generic_handlers[-1]
++        self.assertIsInstance(handler.body[-1], ast.Raise)
++        self.assertIsNone(handler.body[-1].exc)
++        handler_source = ast.get_source_segment(source, handler)
++        self.assertIn("_record_failure_event(agent, config)", handler_source)
++
++
++if __name__ == "__main__":
++    unittest.main()
