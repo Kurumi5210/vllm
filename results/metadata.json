@@ -1,0 +1,35 @@
+{
+  "python": "3.8.16 (default, Mar  2 2023, 03:21:46) \n[GCC 11.2.0]",
+  "platform": "Linux-4.9.151-015.ali3000.alios7.x86_64-x86_64-with-glibc2.17",
+  "machine": "x86_64",
+  "processor": "x86_64",
+  "template_config": "experiments/correctness/configs/gpt_1_3B_12layers_pp4_dp2_8gpu.json",
+  "profile_dir": "profiled-time-eurosys",
+  "output_dir": "experiments/reconfigure_complexity/results",
+  "profile_load_ms": 1020.915559,
+  "layer_cost_table_build_ms": 1.883432,
+  "layer_cost_table_entries": 18,
+  "stages": [
+    2,
+    4,
+    8,
+    16,
+    32
+  ],
+  "allocation_counts": [
+    8,
+    16,
+    32,
+    64,
+    128,
+    256,
+    512
+  ],
+  "layers_per_stage": 4,
+  "lost_layers": 4,
+  "gpus_per_node": 4,
+  "max_tp": 4,
+  "memory_limit_mb": 32000,
+  "warmups": 1,
+  "repeats": 3
+}
